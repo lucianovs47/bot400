@@ -215,7 +215,7 @@ class PredictFunConnector extends EventEmitter {
       // The server uses ecrecover (not EIP-1271) on the auth endpoint.
       // JWT issued for wallet.address; order.signer also = wallet.address → they match.
       const authResp = await axios.post(`${this.baseUrl}/v1/auth`, {
-        signer: this.wallet.address,
+        signer: this.predictAccount || this.wallet.address,
         signature,
         message,
       }, { headers: { 'x-api-key': this.apiKey }, timeout: 10_000 });
@@ -1222,7 +1222,7 @@ const orderValue = {
   nonce,
   feeRateBps:    BigInt(feeRateBps),
   side:          side,
-  signatureType: 0,
+  signatureType: 1,  // POLY_PROXY / Smart Wallet
 };
 
 // Assina o orderValue com EIP-712
