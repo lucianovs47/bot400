@@ -1187,26 +1187,31 @@ class PredictFunConnector extends EventEmitter {
     // BUY: makerAmount=USDT to pay, takerAmount=shares to receive
     // SELL: makerAmount=shares to sell, takerAmount=USDT to receive
     const sharesWei = toWei(size);
-    const usdtWei   = toWei(price * size);
-    const makerAmount = side === 0 ? usdtWei   : sharesWei; // BUY: pay USDT; SELL: give shares
-    const takerAmount = side === 0 ? sharesWei  : usdtWei;  // BUY: get shares; SELL: get USDT
+    const priceWei  = toWei(price);
+    
+    // Cálculo seguro usando BigInt (evita erro de floating point do JavaScript)
+    // Ex: 0.65 * 3.26 agora fica exato, sem sobra de 0.0000000000000003
+    const usdtWei   = (priceWei * sharesWei) / BigInt(1_000_000_000_000_000_000n); // divide por 1e18
 
-    const salt       = BigInt(Math.floor(Math.random() * 1e15));
+    const makerAmount = side === 0 ? usdtWei : sharesWei; // BUY: pay USDT; SELL: give shares
+    const takerAmount = side === 0 ? sharesWei : usdtWei; // BUY: get shares; SELL: get USDT
+
+    const salt = BigInt(Math.floor(Math.random() * 1e15));
     const expiration = BigInt(Math.floor(Date.now() / 1000) + 300); // 5 min (MARKET strategy)
-    const nonce      = BigInt(0);
+    const nonce = BigInt(0);
 
     const orderValue = {
-      salt:          salt,
-      maker:         makerAddress,
-      signer:        signerAddress,
-      taker:         '0x0000000000000000000000000000000000000000',
-      tokenId:       BigInt(tokenId),
+      salt: salt,
+      maker: makerAddress,
+      signer: signerAddress,
+      taker: '0x0000000000000000000000000000000000000000',
+      tokenId: BigInt(tokenId),
       makerAmount,
       takerAmount,
       expiration,
       nonce,
-      feeRateBps:    BigInt(feeRateBps),
-      side:          side,
+      feeRateBps: BigInt(feeRateBps),
+      side: side,
       signatureType: 0,
     };
 
