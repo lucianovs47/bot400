@@ -1193,12 +1193,12 @@ class PredictFunConnector extends EventEmitter {
     // Ex: 0.65 * 3.26 agora fica exato, sem sobra de 0.0000000000000003
     const usdtWei   = (priceWei * sharesWei) / BigInt(1_000_000_000_000_000_000n); // divide por 1e18
 
-    // === DEBUG - veja exatamente o que está sendo enviado ===
-    console.log(`[PredictFun] DEBUG AMOUNTS → size=${size} price=${price} | sharesWei=${sharesWei} usdtWei=${usdtWei} makerAmount=${makerAmount} takerAmount=${takerAmount}`);
-    
     const makerAmount = side === 0 ? usdtWei : sharesWei; // BUY: pay USDT; SELL: give shares
     const takerAmount = side === 0 ? sharesWei : usdtWei; // BUY: get shares; SELL: get USDT
 
+    // === DEBUG - veja exatamente o que está sendo enviado ===
+    console.log(`[PredictFun] DEBUG AMOUNTS → size=${size} price=${price} | usdtWei=${usdtWei} sharesWei=${sharesWei}`);
+    
     const salt = BigInt(Math.floor(Math.random() * 1e15));
     const expiration = BigInt(Math.floor(Date.now() / 1000) + 300); // 5 min (MARKET strategy)
     const nonce = BigInt(0);
