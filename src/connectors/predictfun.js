@@ -918,10 +918,13 @@ class PredictFunConnector extends EventEmitter {
         return null;
       }
 
-      const orderId = String(rdata.orderId);
-      console.log(`[PredictFun] order placed orderId=${orderId} — polling for fill...`);
+      const orderId   = String(rdata.orderId);
+      // Doc: GET /v1/orders/{hash} — o endpoint correto para consultar uma ordem específica
+      // GET /v1/orders não aceita orderId como query param (só first/after/status)
+      const orderHash = rdata.orderHash || hash;
+      console.log(`[PredictFun] order placed orderId=${orderId} hash=${orderHash.slice(0,12)}... — polling for fill...`);
 
-      const fillData = await this._pollFill(orderId, 10000);
+      const fillData = await this._pollFill(orderHash, 10000);
       if (fillData) {
         return {
           orderId,
@@ -975,26 +978,36 @@ class PredictFunConnector extends EventEmitter {
     };
   }
 
-  async _pollFill(orderId, maxMs) {
-    const POLL_INTERVAL = 400;
+  // Doc: GET /v1/orders/{hash} — busca ordem específica pelo hash
+  // GET /v1/orders não aceita orderId como param — só first/after/status
+  async _pollFill(orderHash, maxMs) {
+    const POLL_INTERVAL = 500;
     const deadline      = Date.now() + maxMs;
     await this._ensureJwt();
+
     while (Date.now() < deadline) {
       try {
-        const resp   = await axios.get(`${this.baseUrl}/v1/orders`, { headers: this._headers(), params: { orderId, limit: 1 }, timeout: 5_000 });
-        const data   = resp.data?.data || resp.data;
-        const orders = Array.isArray(data) ? data : (data?.orders || []);
-        const o      = orders.find(x => String(x.id || x.orderId) === orderId);
+        const resp = await axios.get(`${this.baseUrl}/v1/orders/${orderHash}`, {
+          headers: this._headers(),
+          timeout: 5_000,
+        });
+        const o = resp.data?.data || resp.data;
         if (o) {
           const status = o.status || '';
           if (status === 'FILLED' || status === 'PARTIALLY_FILLED') return this._parseFill(o);
-          if (status === 'CANCELLED' || status === 'EXPIRED') {
-            console.warn(`[PredictFun] order ${orderId} status=${status}`);
+          if (status === 'CANCELLED' || status === 'EXPIRED' || status === 'INVALIDATED') {
+            console.warn(`[PredictFun] order ${orderHash.slice(0,12)}... status=${status}`);
             this._lastOrderError = { type: 'liquidity', message: `order ${status}` };
             return null;
           }
+          // status OPEN — ainda não preenchida, continua polling
         }
-      } catch (_) {}
+      } catch (err) {
+        // 404 = ordem ainda não indexada, continua tentando
+        if (err.response?.status !== 404) {
+          console.debug(`[PredictFun] _pollFill error: ${err.response?.status || err.message}`);
+        }
+      }
       await new Promise(r => setTimeout(r, POLL_INTERVAL));
     }
     return null;
