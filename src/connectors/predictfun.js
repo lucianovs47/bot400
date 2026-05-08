@@ -1203,8 +1203,8 @@ const nonce      = BigInt(0);
 
 const orderValue = {
   salt,
-  maker:         makerAddress,    // predictAccount  — quem tem o USDT
-  signer:        signerAddress,   // wallet.address  — quem assina ✅ (era makerAddress, ERRO)
+  maker:         signerAddress,   // wallet.address — maker deve === signer ✅
+  signer:        signerAddress,   // wallet.address — quem assina ✅
   taker:         '0x0000000000000000000000000000000000000000',
   tokenId:       BigInt(tokenId),
   makerAmount,
@@ -1240,8 +1240,8 @@ const body = {
     slippageBps:    50,
     order: {
       salt:          salt.toString(),
-      maker:         makerAddress,    // predictAccount  — quem tem o USDT
-      signer:        signerAddress,   // wallet.address  — quem assina ✅ (era makerAddress, ERRO)
+      maker:         signerAddress,   // wallet.address — maker deve === signer ✅
+      signer:        signerAddress,   // wallet.address — quem assina ✅
       taker:         '0x0000000000000000000000000000000000000000',
       tokenId:       tokenId,
       makerAmount:   makerAmtStr,
