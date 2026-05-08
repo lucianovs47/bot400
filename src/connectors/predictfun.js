@@ -1189,18 +1189,17 @@ class PredictFunConnector extends EventEmitter {
     const sharesWei = toWei(size);
     const priceWei  = toWei(price);
     
-    // Cálculo base seguro
+    // Cálculo base
     let usdtWei = (priceWei * sharesWei) / BigInt(1_000_000_000_000_000_000n);
 
-    // Adiciona o FEE da plataforma (exatamente como a Predict calcula internamente)
-    const fee = (usdtWei * BigInt(feeRateBps)) / BigInt(10000);
-    usdtWei = usdtWei + fee;   // ← isso é o que estava faltando
+    // BUFFER DE 20% (o que está funcionando na prática para evitar o erro)
+    usdtWei = (usdtWei * BigInt(120)) / BigInt(100);
 
     const makerAmount = side === 0 ? usdtWei : sharesWei;
     const takerAmount = side === 0 ? sharesWei : usdtWei;
 
-    // DEBUG (para vermos o valor exato que está sendo enviado)
-    console.log(`[PredictFun] DEBUG AMOUNTS → size=${size} price=${price} feeRateBps=${feeRateBps} | usdtWei=${usdtWei} sharesWei=${sharesWei}`);
+    // DEBUG COMPLETO
+    console.log(`[PredictFun] DEBUG AMOUNTS → size=${size} price=${price} feeRateBps=${feeRateBps} | usdtWei=${usdtWei} sharesWei=${sharesWei} makerAmount=${makerAmount}`);
 
     const salt = BigInt(Math.floor(Math.random() * 1e15));
     const expiration = BigInt(Math.floor(Date.now() / 1000) + 300);
