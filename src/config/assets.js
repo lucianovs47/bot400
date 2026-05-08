@@ -33,28 +33,6 @@ const ASSETS = {
     kalshi:      { seriesTicker: 'KXETH15M' },
     polymarket:  { slugPrefix: 'eth-updown-15m' },
   },
-  SOL: {
-    symbol: 'SOL',
-    name: 'Solana',
-    enabled: false,
-    strikeFilter: {
-      minSpreadPct: 2.5,
-      maxSlippagePct: 0.8,
-    },
-    kalshi:      { seriesTicker: 'KXSOL15M' },
-    polymarket:  { slugPrefix: 'sol-updown-15m' },
-  },
-  XRP: {
-    symbol: 'XRP',
-    name: 'XRP',
-    enabled: false,
-    strikeFilter: {
-      minSpreadPct: 2.5,
-      maxSlippagePct: 0.8,
-    },
-    kalshi:      { seriesTicker: 'KXXRP15M' },
-    polymarket:  { slugPrefix: 'xrp-updown-15m' },
-  },
 };
 
 module.exports = { ASSETS };
