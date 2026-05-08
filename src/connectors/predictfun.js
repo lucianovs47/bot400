@@ -1187,49 +1187,34 @@ class PredictFunConnector extends EventEmitter {
     // BUY: makerAmount=USDT to pay, takerAmount=shares to receive
     // SELL: makerAmount=shares to sell, takerAmount=USDT to receive
     const sharesWei = toWei(size);
-    const priceWei  = toWei(price);
-    
-    // Cálculo base
-    let usdtWei = (priceWei * sharesWei) / BigInt(1_000_000_000_000_000_000n);
+const priceWei  = toWei(price);
 
-    // BUFFER DE 20% (o que está funcionando na prática para evitar o erro)
-    usdtWei = (usdtWei * BigInt(150)) / BigInt(100);
+// Cálculo base sem buffer manual — slippage é tratado pelo slippageBps no body
+let usdtWei = (priceWei * sharesWei) / BigInt(1_000_000_000_000_000_000n);
 
-    const makerAmount = side === 0 ? usdtWei : sharesWei;
-    const takerAmount = side === 0 ? sharesWei : usdtWei;
+const makerAmount = side === 0 ? usdtWei : sharesWei;
+const takerAmount = side === 0 ? sharesWei : usdtWei;
 
-    // DEBUG COMPLETO
-    console.log(`[PredictFun] DEBUG AMOUNTS → size=${size} price=${price} feeRateBps=${feeRateBps} | usdtWei=${usdtWei} sharesWei=${sharesWei} makerAmount=${makerAmount}`);
+console.log(`[PredictFun] DEBUG AMOUNTS → size=${size} price=${price} feeRateBps=${feeRateBps} | usdtWei=${usdtWei} sharesWei=${sharesWei} makerAmount=${makerAmount}`);
 
-    const salt = BigInt(Math.floor(Math.random() * 1e15));
-    const expiration = BigInt(Math.floor(Date.now() / 1000) + 300);
-    const nonce = BigInt(0);
+const salt = BigInt(Math.floor(Math.random() * 1e15));
+const expiration = BigInt(Math.floor(Date.now() / 1000) + 300);
+const nonce = BigInt(0);
 
-    const orderValue = {
-      salt: salt,
-      maker: makerAddress,
-      signer: signerAddress,
-      taker: '0x0000000000000000000000000000000000000000',
-      tokenId: BigInt(tokenId),
-      makerAmount,
-      takerAmount,
-      expiration,
-      nonce,
-      feeRateBps: BigInt(feeRateBps),
-      side: side,
-      signatureType: 0,
-    };
-
-    let signature;
-    try {
-      const t0 = Date.now();
-      signature = await this.wallet.signTypedData(domain, ORDER_TYPES, orderValue);
-      console.log(`[PredictFun] EIP-712 sign took ${Date.now() - t0}ms`);
-    } catch (err) {
-      console.error('[PredictFun] EIP-712 sign failed:', err.message);
-      this._lastOrderError = { type: 'other', message: err.message };
-      return null;
-    }
+const orderValue = {
+  salt: salt,
+  maker: makerAddress,    // predictAccount
+  signer: makerAddress,   // predictAccount — doc: "set signer and maker to predictAccount"
+  taker: '0x0000000000000000000000000000000000000000',
+  tokenId: BigInt(tokenId),
+  makerAmount,
+  takerAmount,
+  expiration,
+  nonce,
+  feeRateBps: BigInt(feeRateBps),
+  side: side,
+  signatureType: 0,
+};
 
     // predict.fun API requires pricePerShare as uint256 wei string (1e18).
     // e.g. 0.3 → "300000000000000000". toWei() handles IEEE-754 precision.
@@ -1240,12 +1225,12 @@ class PredictFunConnector extends EventEmitter {
       data: {
         strategy:      'MARKET',
         pricePerShare: priceStr,
-        isMinAmountOut: false,
+        isMinAmountOut: side === 0,
         slippageBps:   50, // 0.5% slippage tolerance to improve fill rate
         order: {
           salt:          salt.toString(),
           maker:         makerAddress,
-          signer:        signerAddress,
+          signer:        makerAddress,
           taker:         '0x0000000000000000000000000000000000000000',
           tokenId:       tokenId,
           makerAmount:   makerAmtStr,
