@@ -1193,7 +1193,7 @@ class PredictFunConnector extends EventEmitter {
     let usdtWei = (priceWei * sharesWei) / BigInt(1_000_000_000_000_000_000n);
 
     // BUFFER DE 20% (o que está funcionando na prática para evitar o erro)
-    usdtWei = (usdtWei * BigInt(120)) / BigInt(100);
+    usdtWei = (usdtWei * BigInt(150)) / BigInt(100);
 
     const makerAmount = side === 0 ? usdtWei : sharesWei;
     const takerAmount = side === 0 ? sharesWei : usdtWei;
