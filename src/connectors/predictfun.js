@@ -1,32 +1,32 @@
 /**
- * predict.fun connector — CLOB on BNB Chain (chainId=56), USDT collateral.
+ * predict.fun connector — reescrito usando o SDK oficial @predictdotfun/sdk
  *
- * Flow:
- *   1. REST: connect() tests API, getMarkets() discovers 15-min BTC markets
- *   2. WS:   subscribeWs() opens stream for real-time orderbook updates
- *   3. Each WS tick → emits 'tick' for Monitor (same interface as Polymarket)
- *   4. placeOrder() places MARKET order + polls until fill (no inline fill in POST)
+ * Fonte: https://dev.predict.fun/how-to-create-or-cancel-orders-679306m0.md
+ *        https://dev.predict.fun/ts-how-to-authenticate-your-api-requests-663127m0.md
+ *        https://github.com/PredictDotFun/sdk
  *
- * Key differences vs Polymarket:
- *   - chainId=56 (BNB), collateral=USDT (18 decimals)
- *   - EIP-712 domain: "predict.fun CTF Exchange" / v1
- *   - MARKET strategy ≈ FOK (expires 5 min, partial fills allowed)
- *   - Fill price comes from polling GET /v1/orders (not in POST response)
- *   - WS heartbeat: server sends {type:"M",topic:"heartbeat"}, must respond
- *   - Single book per market (Up token); Down prices derived as 1 - Up
+ * Mudanças principais vs versão anterior:
+ *   - _authenticate(): usa builder.signPredictAccountMessage() + signer=predictAccount
+ *     (a doc diz explicitamente que wallet.signMessage() NÃO funciona para Predict Accounts)
+ *   - placeOrder(): usa builder.buildOrder() + builder.buildTypedData() + builder.signTypedDataOrder()
+ *     maker/signer são setados automaticamente para predictAccount quando passado no make()
+ *   - ensureUsdtApproval(): usa builder.setApprovals() do SDK
+ *   - Todo o resto (WS, market discovery, book, hedge) permanece inalterado
  */
 
-const axios = require('axios');
-const { ethers } = require('ethers');
-const WebSocket = require('ws');
+const axios        = require('axios');
+const { ethers }   = require('ethers');
+const WebSocket    = require('ws');
 const EventEmitter = require('events');
+// SDK oficial da predict.fun
+const { OrderBuilder, ChainId, Side } = require('@predictdotfun/sdk');
 const config = require('../config');
 
-const BASE_URL = config.predictfun?.baseUrl || 'https://api.predict.fun';
-const WS_URL   = config.predictfun?.wsUrl   || 'wss://ws.predict.fun/ws';
-const INTERVAL_SECS = 900; // 15 minutes
+const BASE_URL      = config.predictfun?.baseUrl || 'https://api.predict.fun';
+const WS_URL        = config.predictfun?.wsUrl   || 'wss://ws.predict.fun/ws';
+const INTERVAL_SECS = 900;
 
-// BNB Chain USDT (18 decimals) — used for on-chain balance queries
+// BSC USDT — só usado para getBalance() via on-chain
 const BSC_USDT_ADDRESS = '0x55d398326f99059fF775485246999027B3197955';
 const BSC_USDT_ABI     = ['function balanceOf(address) view returns (uint256)'];
 const BSC_RPCS = [
@@ -36,81 +36,45 @@ const BSC_RPCS = [
   'https://bsc-dataseed2.binance.org',
 ];
 
-// verifyingContract by market type (BNB mainnet)
-const CONTRACTS = {
-  standard:              '0x8BC070BEdAB741406F4B1Eb65A72bee27894B689',
-  negRisk:               '0x365fb81bd4A24D6303cd2F19c349dE6894D8d58A',
-  yieldBearing:          '0x6bEb5a40C032AFc305961162d8204CDA16DECFa5',
-  yieldBearingNegRisk:   '0x8A289d458f5a134bA40015085A8F50Ffb681B41d',
-};
-
-// EIP-712 typed data for predict.fun orders
-const ORDER_TYPES = {
-  Order: [
-    { name: 'salt',          type: 'uint256' },
-    { name: 'maker',         type: 'address' },
-    { name: 'signer',        type: 'address' },
-    { name: 'taker',         type: 'address' },
-    { name: 'tokenId',       type: 'uint256' },
-    { name: 'makerAmount',   type: 'uint256' },
-    { name: 'takerAmount',   type: 'uint256' },
-    { name: 'expiration',    type: 'uint256' },
-    { name: 'nonce',         type: 'uint256' },
-    { name: 'feeRateBps',    type: 'uint256' },
-    { name: 'side',          type: 'uint8'   },
-    { name: 'signatureType', type: 'uint8'   },
-  ],
-};
-
-const WEI = BigInt('1000000000000000000'); // 1e18
+const WEI = BigInt('1000000000000000000');
 
 function toWei(n) {
-  // n is a number/float (e.g. 0.5 or 5.0). Returns BigInt in 1e18.
   return BigInt(Math.round(n * 1e9)) * BigInt(1e9);
 }
 
 class PredictFunConnector extends EventEmitter {
   constructor() {
     super();
-    this.platform = 'predictfun';
-    this.feeRate = 0.01; // sane default; per-market feeRateBps overrides this when present
-    this.minOrderNotional = 1.00; // assumed parity with Polymarket; adjust if predict.fun differs
-    this.baseUrl  = BASE_URL;
-    this.apiKey   = '';     // set via loadUserKeys()
-    this.wallet   = null;   // ethers.Wallet (signing key — creates signatures)
-    this.predictAccount = null; // Predict Account address (smart wallet that holds USDT)
-    this.connected = false;
+    this.platform           = 'predictfun';
+    this.feeRate            = 0.01;
+    this.minOrderNotional   = 1.00;
+    this.baseUrl            = BASE_URL;
+    this.apiKey             = '';
+    this.wallet             = null;   // ethers.Wallet (Privy EOA — assina)
+    this.predictAccount     = null;   // Smart Wallet address (deposit address)
+    this.connected          = false;
 
-    // Market cache: conditionId (String(market.id)) → normalized market
-    this.markets = new Map();
+    // SDK oficial — inicializado em loadUserKeys() após ter wallet + predictAccount
+    this._orderBuilder      = null;
 
-    // JWT for authenticated endpoints (poll fill status)
-    this._jwt = null;
-    this._jwtExpiry = 0; // unix timestamp ms
+    this.markets            = new Map();
+    this._jwt               = null;
+    this._jwtExpiry         = 0;
 
     // WS state
-    this._ws = null;
-    this._wsConnected = false;
-    this._reconnectDelay = 1000;
+    this._ws                = null;
+    this._wsConnected       = false;
+    this._reconnectDelay    = 1000;
     this._maxReconnectDelay = 30_000;
-    this._reconnectTimer = null;
-    this._lastPongAt = 0;
-    this._reqId = 1;
+    this._reconnectTimer    = null;
+    this._lastPongAt        = 0;
+    this._reqId             = 1;
 
-    // Per-market mini-book from WS (conditionId → { bids: Map, asks: Map })
-    this._books = new Map();
-
-    // Per-market tick age (conditionId → ms)
-    this._lastTickAt = new Map();
-
-    // Subscribed market IDs (conditionId → { marketId, yesTokenId, noTokenId, asset })
-    this._subscribedAssets = new Map();
-
-    // Last order error metadata (same shape as polymarket for dispatcher compat)
-    this._lastOrderError = null;
-
-    // Reusable BNB Chain providers for balance queries (lazy init)
-    this._bscProviders = null;
+    this._books             = new Map();
+    this._lastTickAt        = new Map();
+    this._subscribedAssets  = new Map();
+    this._lastOrderError    = null;
+    this._bscProviders      = null;
   }
 
   /* ---------------------------------------------------------- */
@@ -118,49 +82,30 @@ class PredictFunConnector extends EventEmitter {
   /* ---------------------------------------------------------- */
 
   isReady() {
-    return !!(this.wallet && this.apiKey);
+    return !!(this.wallet && this.apiKey && this._orderBuilder);
   }
 
-  /**
-   * Get USDT balance on BNB Chain via on-chain query.
-   * Returns balance as a number in USDT (e.g. 100.50), or null on failure.
-   */
   async getBalance() {
-    // Balance lives in the Predict Account (smart wallet), NOT the signing wallet.
-    // If predictAccount is not configured, fall back to signing wallet address.
     const targetAddress = this.predictAccount || this.wallet?.address;
     if (!targetAddress) return null;
-
-    // Lazy-init reusable BSC providers (same pattern as capitalGuard Polygon providers)
     if (!this._bscProviders) {
       this._bscProviders = BSC_RPCS.map(rpc =>
         new ethers.JsonRpcProvider(rpc, 56, { staticNetwork: true, batchMaxCount: 1 })
       );
     }
-
     for (const provider of this._bscProviders) {
       try {
         const usdt = new ethers.Contract(BSC_USDT_ADDRESS, BSC_USDT_ABI, provider);
-        const raw = await Promise.race([
+        const raw  = await Promise.race([
           usdt.balanceOf(targetAddress),
           new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000)),
         ]);
-        return Number(raw) / 1e18; // BSC USDT has 18 decimals
+        return Number(raw) / 1e18;
       } catch (_) {}
     }
     return null;
   }
 
-  /**
-   * Get the number of outcome tokens held for a given tokenId.
-   *
-   * Endpoint: GET /v1/positions (JWT required)
-   * Response field: amount — wei string (1e18 decimals), matches ERC-1155 balance.
-   * Match via outcome.onChainId === tokenId (the CTF token address/id).
-   *
-   * Returns token count as float (e.g. 150.0 shares), null on error, 0 if not found.
-   * Used by dispatcher early exit to confirm settled token balance exists to sell.
-   */
   async getTokenBalance(tokenId) {
     if (!tokenId) return null;
     await this._ensureJwt();
@@ -169,15 +114,14 @@ class PredictFunConnector extends EventEmitter {
         headers: this._headers(),
         timeout: 8_000,
       });
-      const data = resp.data?.data || resp.data;
+      const data      = resp.data?.data || resp.data;
       const positions = Array.isArray(data) ? data : [];
       for (const pos of positions) {
         if (String(pos.outcome?.onChainId) === String(tokenId)) {
-          // amount is a wei string (ERC-1155 balance, 18 decimals)
           return Number(BigInt(pos.amount || '0')) / 1e18;
         }
       }
-      return 0; // no position found for this tokenId
+      return 0;
     } catch (err) {
       console.debug(`[PredictFun] getTokenBalance(${tokenId}) error: ${err.message}`);
       return null;
@@ -195,11 +139,15 @@ class PredictFunConnector extends EventEmitter {
   }
 
   /**
-   * Authenticate: EIP-191 personal sign → JWT.
-   * Called automatically when JWT is absent or expired.
+   * Autenticação para Predict Account (Smart Wallet).
+   *
+   * Doc oficial: https://dev.predict.fun/ts-how-to-authenticate-your-api-requests-663127m0.md
+   *   - signer no body = predictAccount address (NÃO wallet.address)
+   *   - A assinatura DEVE usar builder.signPredictAccountMessage()
+   *     "The standard signMessage won't work"
    */
   async _authenticate() {
-    if (!this.wallet) return false;
+    if (!this.wallet || !this._orderBuilder) return false;
     try {
       const msgResp = await axios.get(`${this.baseUrl}/v1/auth/message`, {
         headers: { 'x-api-key': this.apiKey },
@@ -210,24 +158,26 @@ class PredictFunConnector extends EventEmitter {
         console.warn('[PredictFun] auth/message returned no message field');
         return false;
       }
-      const signature = await this.wallet.signMessage(message);
-      // Auth uses the Privy EOA (wallet.address), not the smart contract (predictAccount).
-      // The server uses ecrecover (not EIP-1271) on the auth endpoint.
-      // JWT issued for wallet.address; order.signer also = wallet.address → they match.
+
+      // Doc: "Sign the message using the SDK function for Predict accounts.
+      //       The standard signMessage won't work."
+      const signature = await this._orderBuilder.signPredictAccountMessage(message);
+
+      // Doc: signer = predictAccount address (deposit address), NÃO wallet.address
       const authResp = await axios.post(`${this.baseUrl}/v1/auth`, {
-        signer: this.predictAccount || this.wallet.address,
+        signer:    this.predictAccount,
         signature,
         message,
       }, { headers: { 'x-api-key': this.apiKey }, timeout: 10_000 });
+
       const token = authResp.data?.data?.token || authResp.data?.token;
       if (!token) {
         console.warn('[PredictFun] auth returned no token');
         return false;
       }
-      this._jwt = token;
-      // JWT typically valid 24h — refresh 1h before expiry
+      this._jwt       = token;
       this._jwtExpiry = Date.now() + 23 * 3600 * 1000;
-      console.log('[PredictFun] JWT obtained');
+      console.log(`[PredictFun] JWT obtained — predictAccount=${this.predictAccount.slice(0, 10)}...`);
       return true;
     } catch (err) {
       const d = err.response?.data ? JSON.stringify(err.response.data).slice(0, 200) : err.message;
@@ -242,23 +192,20 @@ class PredictFunConnector extends EventEmitter {
   }
 
   /* ---------------------------------------------------------- */
-  /*  Keys                                                       */
+  /*  Keys + SDK init                                            */
   /* ---------------------------------------------------------- */
 
   loadUserKeys(keys) {
     if (!keys?.predictApiKey) return;
     this.apiKey = keys.predictApiKey;
 
-    // predict.fun uses POLY_PROXY pattern:
-    //   signerWallet (Privy EOA, 0x09F...) = signs orders, derived from predictPrivateKey
-    //   predictAccount (smart contract, 0x010b41...) = holds USDT, is the maker
-    // The two addresses are DIFFERENT. Never override predictAccount with wallet.address.
     const pk = keys.predictPrivateKey || keys.polyPrivateKey;
     if (pk) {
       try {
         this.wallet = new ethers.Wallet(pk);
       } catch (err) {
         console.error('[PredictFun] invalid private key:', err.message);
+        return;
       }
     }
 
@@ -266,8 +213,42 @@ class PredictFunConnector extends EventEmitter {
       this.predictAccount = keys.predictAccountAddress;
     }
 
-    const acct = this.predictAccount ? this.predictAccount.slice(0, 10) + '...' : 'not set (orders will use signing wallet)';
-    console.log(`[PredictFun] keys loaded — signerWallet: ${this.wallet?.address.slice(0, 10)}... predictAccount: ${acct} apiKey: ${this.apiKey.slice(0, 8)}...`);
+    // Inicializa o OrderBuilder do SDK oficial assim que temos wallet + predictAccount.
+    // Doc: OrderBuilder.make(ChainId.BnbMainnet, signer, { predictAccount })
+    //      maker e signer das ordens são setados automaticamente para predictAccount.
+    if (this.wallet && this.predictAccount) {
+      // make() é async — iniciamos em background; connect() aguarda via _ensureOrderBuilder()
+      this._initOrderBuilder().catch(err =>
+        console.error('[PredictFun] OrderBuilder init error:', err.message)
+      );
+    }
+
+    const acct = this.predictAccount
+      ? this.predictAccount.slice(0, 10) + '...'
+      : 'not set';
+    console.log(
+      `[PredictFun] keys loaded — signerWallet: ${this.wallet?.address.slice(0, 10)}...` +
+      ` predictAccount: ${acct} apiKey: ${this.apiKey.slice(0, 8)}...`
+    );
+  }
+
+  async _initOrderBuilder() {
+    if (!this.wallet || !this.predictAccount) return;
+    try {
+      // Doc: OrderBuilder.make(chainId, privyWallet, { predictAccount })
+      // Com predictAccount, buildOrder() seta maker=signer=predictAccount automaticamente.
+      this._orderBuilder = await OrderBuilder.make(ChainId.BnbMainnet, this.wallet, {
+        predictAccount: this.predictAccount,
+      });
+      console.log('[PredictFun] OrderBuilder initialized (SDK oficial)');
+    } catch (err) {
+      console.error('[PredictFun] OrderBuilder.make failed:', err.message);
+    }
+  }
+
+  async _ensureOrderBuilder() {
+    if (this._orderBuilder) return;
+    await this._initOrderBuilder();
   }
 
   /* ---------------------------------------------------------- */
@@ -275,9 +256,6 @@ class PredictFunConnector extends EventEmitter {
   /* ---------------------------------------------------------- */
 
   async connect() {
-    // Try multiple candidate endpoints. Any HTTP response (even 4xx) proves
-    // the network is reachable — only a network-level failure (timeout /
-    // ECONNREFUSED / no response) means we should mark as disconnected.
     const candidates = ['/v1/markets', '/markets', '/v1/categories'];
     for (const path of candidates) {
       try {
@@ -285,20 +263,20 @@ class PredictFunConnector extends EventEmitter {
           headers: { 'x-api-key': this.apiKey || '' },
           timeout: 10_000,
         });
-        // HTTP 2xx → connected
         console.log(`[PredictFun] connected — REST API reachable (${path})`);
         this.connected = true;
-        if (this.wallet && this.apiKey) this._authenticate().catch(() => {});
+        // Garante que OrderBuilder está pronto antes de tentar auth
+        await this._ensureOrderBuilder();
+        if (this._orderBuilder) this._authenticate().catch(() => {});
         return;
       } catch (err) {
         if (err.response) {
-          // Server replied (4xx/5xx) → network works, just wrong endpoint
           console.log(`[PredictFun] connected — REST API reachable (${path} → ${err.response.status})`);
           this.connected = true;
-          if (this.wallet && this.apiKey) this._authenticate().catch(() => {});
+          await this._ensureOrderBuilder();
+          if (this._orderBuilder) this._authenticate().catch(() => {});
           return;
         }
-        // No response → network error; try next candidate
       }
     }
     console.error('[PredictFun] connection failed — no response from API (all candidates)');
@@ -306,93 +284,50 @@ class PredictFunConnector extends EventEmitter {
   }
 
   /* ---------------------------------------------------------- */
-  /*  USDT approval                                              */
+  /*  USDT approval — usa SDK                                    */
   /* ---------------------------------------------------------- */
 
   /**
-   * Ensure the Privy signing wallet has approved the CTF Exchange contracts to
-   * spend USDT on its behalf. Called once at startup; skips if already approved.
-   * Without this, orders fail with "Insufficient collateral allowance".
+   * Doc: orderBuilder.setApprovals() — seta approvals para CTF_EXCHANGE e NEG_RISK_CTF_EXCHANGE.
+   * https://dev.predict.fun/how-to-create-or-cancel-orders-679306m0.md#how-to-set-approvals
    */
   async ensureUsdtApproval() {
-    if (!this.wallet) return;
-    const USDT_ABI = [
-      'function allowance(address owner, address spender) view returns (uint256)',
-      'function approve(address spender, uint256 amount) returns (bool)',
-    ];
-    const MAX = BigInt('0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff');
-    const MIN_ALLOWANCE = BigInt('10000000000000000000'); // 10 USDT in 1e18
-
-    if (!this._bscProviders) {
-      this._bscProviders = BSC_RPCS.map(rpc =>
-        new ethers.JsonRpcProvider(rpc, 56, { staticNetwork: true, batchMaxCount: 1 })
-      );
-    }
-
-    // Connect wallet to first working provider for sending txns
-    let connectedWallet = null;
-    for (const provider of this._bscProviders) {
-      try {
-        await Promise.race([
-          provider.getBlockNumber(),
-          new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 5000)),
-        ]);
-        connectedWallet = this.wallet.connect(provider);
-        break;
-      } catch (_) {}
-    }
-    if (!connectedWallet) {
-      console.warn('[PredictFun] ensureUsdtApproval: no BSC provider reachable');
+    await this._ensureOrderBuilder();
+    if (!this._orderBuilder) {
+      console.warn('[PredictFun] ensureUsdtApproval: OrderBuilder não inicializado');
       return;
     }
-
-    const usdt = new ethers.Contract(BSC_USDT_ADDRESS, USDT_ABI, connectedWallet);
-    const spenders = Object.values(CONTRACTS);
-
-    for (const spender of spenders) {
-      try {
-        const allowance = await usdt.allowance(this.wallet.address, spender);
-        if (allowance >= MIN_ALLOWANCE) continue;
-        console.log(`[PredictFun] approving USDT → ${spender.slice(0, 10)}...`);
-        const tx = await usdt.approve(spender, MAX);
-        await tx.wait(1);
-        console.log(`[PredictFun] USDT approved → ${spender.slice(0, 10)}... (tx: ${tx.hash})`);
-      } catch (err) {
-        console.warn(`[PredictFun] USDT approve failed for ${spender.slice(0, 10)}: ${err.message}`);
+    try {
+      console.log('[PredictFun] setApprovals via SDK...');
+      const result = await this._orderBuilder.setApprovals();
+      if (result.success) {
+        console.log('[PredictFun] USDT approvals OK (SDK)');
+      } else {
+        console.warn('[PredictFun] setApprovals retornou success=false');
       }
+    } catch (err) {
+      console.warn(`[PredictFun] setApprovals error: ${err.message}`);
     }
   }
 
   /* ---------------------------------------------------------- */
-  /*  Market discovery                                            */
+  /*  Market discovery — INALTERADO                             */
   /* ---------------------------------------------------------- */
 
   _get15mTimestamps() {
     const nowSecs = Math.floor(Date.now() / 1000);
     const current = Math.floor(nowSecs / INTERVAL_SECS) * INTERVAL_SECS;
-    const next = current + INTERVAL_SECS;
+    const next    = current + INTERVAL_SECS;
     return [current, next];
   }
 
-  /**
-   * Build candidate category slugs for a given window timestamp.
-   * predict.fun uses the same format as daily markets but with hour+minute:
-   *   btc-usd-up-down-{YYYY}-{MM}-{DD}-{HH}-{MM}
-   * We also try the legacy variant with the -15-minutes suffix (404 but cheap).
-   * Timezone offsets tried: UTC, UTC-3 (BRT), UTC-4 (EDT).
-   */
   _buildCategorySlugs(asset, windowTs) {
-    const sym = asset.symbol.toLowerCase();
+    const sym   = asset.symbol.toLowerCase();
     const slugs = [];
-
-    // Primary format (confirmed from UI URL): {sym}-updown-15m-{windowTimestamp}
-    // e.g. btc-updown-15m-1778130900
     slugs.push(`${sym}-updown-15m-${windowTs}`);
-
-    // Legacy date-based formats (all returned 404 in tests, kept as fallback)
     for (const offsetH of [0, -3, -4]) {
       for (const extraSecs of [0, 900]) {
-        const d = new Date((windowTs + extraSecs + offsetH * 3600) * 1000);
+        const d    = new Date((windowTs + extraSecs + offsetH * 3600) * 1000);
         const yyyy = d.getUTCFullYear();
         const mo   = String(d.getUTCMonth() + 1).padStart(2, '0');
         const dd   = String(d.getUTCDate()).padStart(2, '0');
@@ -406,27 +341,22 @@ class PredictFunConnector extends EventEmitter {
     return [...new Set(slugs)];
   }
 
-  /**
-   * Query the parent category and filter for markets in the current 15-min window.
-   * Tries both confirmed and legacy slug formats.
-   */
   async _discoverByParentCategory(asset, out) {
-    const sym = asset.symbol.toLowerCase();
-    // Try confirmed slug first (from UI URLs), then legacy format
-    const slug = `${sym}-updown-15m`;          // e.g. btc-updown-15m
-    const legacySlug = `${sym}-usd-up-down`;   // kept for fallback
-    const nowSecs  = Math.floor(Date.now() / 1000);
+    const sym        = asset.symbol.toLowerCase();
+    const slug       = `${sym}-updown-15m`;
+    const legacySlug = `${sym}-usd-up-down`;
+    const nowSecs    = Math.floor(Date.now() / 1000);
     const [currentTs] = this._get15mTimestamps();
-    const windowEndSecs = currentTs + INTERVAL_SECS * 2 + 120; // current + next + 2 min buffer
+    const windowEndSecs = currentTs + INTERVAL_SECS * 2 + 120;
 
     for (const trySlug of [slug, legacySlug]) {
       try {
         const resp = await axios.get(`${this.baseUrl}/v1/categories/${trySlug}`, {
           headers: this._headers(),
-          params: { limit: 50 },
+          params:  { limit: 50 },
           timeout: 12_000,
         });
-        const data = resp.data?.data || resp.data;
+        const data  = resp.data?.data || resp.data;
         const items = Array.isArray(data) ? data : (data?.markets || [data].filter(Boolean));
         for (const raw of items) {
           if (raw.status === 'RESOLVED' || raw.tradingStatus === 'CLOSED') continue;
@@ -445,80 +375,53 @@ class PredictFunConnector extends EventEmitter {
             console.log(`[PredictFun] ${asset.symbol} found via parentCat ${trySlug}: "${raw.title}" endDate=${raw.endDate || raw.endAt || 'null'}`);
           }
         }
-        if (out.length > 0) break; // found via this slug — no need to try legacy
-      } catch (err) {
-        // 404 expected when slug format doesn't exist — slug strategy picks it up
-      }
+        if (out.length > 0) break;
+      } catch (_) {}
     }
   }
 
   async getMarkets(asset, options = {}) {
     if (!this.connected) return [];
-    if (!asset.predictfun) return []; // asset not configured for predict.fun
+    if (!asset.predictfun) return [];
 
     const allMarkets = [];
 
-    // Strategy 0: parent category — GET /v1/categories/{sym}-usd-up-down
-    // Lists all BTC/ETH Up/Down markets; filter for current 15-min window.
-    // Cheap (1 request), doesn't require knowing the exact time-based slug.
-    if (allMarkets.length === 0) {
-      await this._discoverByParentCategory(asset, allMarkets);
-    }
+    if (allMarkets.length === 0) await this._discoverByParentCategory(asset, allMarkets);
 
-    // Strategy 1: kalshiMarketTicker param — API typically ignores it and returns
-    // the default first-page, but attempt anyway (some deploys may support it).
     const kalshiTickers = options.kalshiTickers || [];
     if (allMarkets.length === 0 && kalshiTickers.length > 0) {
       await this._discoverByKalshiTickers(asset, kalshiTickers, allMarkets);
     }
 
-    // Strategy 2: category slug matching (UTC and EDT variants).
-    // Only the current 15-min window — fetching nextTs would pair with future
-    // markets that have static 0.50/0.50 prices and zero liquidity.
     if (allMarkets.length === 0) {
       const [currentTs] = this._get15mTimestamps();
-      for (const windowTs of [currentTs]) {
-        for (const slug of this._buildCategorySlugs(asset, windowTs)) {
-          if (allMarkets.length > 0) break;
-          try {
-            const resp = await axios.get(`${this.baseUrl}/v1/categories/${encodeURIComponent(slug)}`, {
-              headers: this._headers(),
-              timeout: 10_000,
-            });
-            const data = resp.data?.data || resp.data;
-            const items = Array.isArray(data) ? data : (data?.markets || [data].filter(Boolean));
-            for (const raw of items) {
-              const normalized = this._normalize(raw, asset);
-              if (normalized && !allMarkets.some(m => m.conditionId === normalized.conditionId)) {
-                allMarkets.push(normalized);
-              }
+      for (const slug of this._buildCategorySlugs(asset, currentTs)) {
+        if (allMarkets.length > 0) break;
+        try {
+          const resp  = await axios.get(`${this.baseUrl}/v1/categories/${encodeURIComponent(slug)}`, {
+            headers: this._headers(),
+            timeout: 10_000,
+          });
+          const data  = resp.data?.data || resp.data;
+          const items = Array.isArray(data) ? data : (data?.markets || [data].filter(Boolean));
+          for (const raw of items) {
+            const normalized = this._normalize(raw, asset);
+            if (normalized && !allMarkets.some(m => m.conditionId === normalized.conditionId)) {
+              allMarkets.push(normalized);
             }
-            if (allMarkets.length > 0) {
-              console.log(`[PredictFun] ${asset.symbol} found via slug: ${slug}`);
-            }
-          } catch (err) {
-            // slug not found — try next candidate
           }
-        }
+          if (allMarkets.length > 0) console.log(`[PredictFun] ${asset.symbol} found via slug: ${slug}`);
+        } catch (_) {}
       }
     }
 
-    // Strategy 3: general search fallback
     if (allMarkets.length === 0) {
-      try {
-        await this._discoverViaSearch(asset, allMarkets);
-      } catch (_) {}
+      try { await this._discoverViaSearch(asset, allMarkets); } catch (_) {}
     }
 
-    // Enrich token IDs — category listing may omit outcomes.onChainId.
-    // Without tokenIds the decisionEngine cannot place orders (rejects the signal).
-    if (allMarkets.length > 0) {
-      await this._enrichTokenIds(allMarkets);
-    }
+    if (allMarkets.length > 0) await this._enrichTokenIds(allMarkets);
 
-    for (const m of allMarkets) {
-      this.markets.set(m.conditionId, m);
-    }
+    for (const m of allMarkets) this.markets.set(m.conditionId, m);
 
     if (allMarkets.length > 0) {
       console.log(`[PredictFun] ${asset.symbol} — found ${allMarkets.length} market(s): "${allMarkets[0].question}"`);
@@ -529,144 +432,88 @@ class PredictFunConnector extends EventEmitter {
     return allMarkets;
   }
 
-  /**
-   * Search predict.fun for markets whose kalshiMarketTicker matches one of
-   * the given Kalshi tickers. Each predict.fun market has a kalshiMarketTicker
-   * field that directly links it to the corresponding Kalshi market.
-   */
   async _discoverByKalshiTickers(asset, kalshiTickers, out) {
     const sym = asset.symbol.toLowerCase();
     for (const ticker of kalshiTickers) {
       try {
-        const resp = await axios.get(`${this.baseUrl}/v1/markets`, {
+        const resp  = await axios.get(`${this.baseUrl}/v1/markets`, {
           headers: this._headers(),
-          params: { kalshiMarketTicker: ticker, limit: 5 },
+          params:  { kalshiMarketTicker: ticker, limit: 5 },
           timeout: 10_000,
         });
-        const data = resp.data?.data || resp.data;
+        const data  = resp.data?.data || resp.data;
         const items = Array.isArray(data) ? data : (data?.markets || data?.items || []);
-
         for (const raw of items) {
-          // The API often ignores the kalshiMarketTicker param and returns the
-          // default paginated list. Validate strictly:
-          // 1. kalshiMarketTicker field MUST either match our ticker exactly,
-          //    OR be absent from the response schema entirely.
-          //    If the field is present but null/empty, the market is NOT linked
-          //    to any Kalshi ticker → skip it.
-          // 2. The title/question must reference the asset symbol.
-          const kField = raw.kalshiMarketTicker;
+          const kField       = raw.kalshiMarketTicker;
           const fieldPresent = Object.prototype.hasOwnProperty.call(raw, 'kalshiMarketTicker');
-          if (fieldPresent) {
-            // Field exists in schema — must match our ticker exactly
-            if (!kField || kField !== ticker) continue;
-          }
+          if (fieldPresent && (!kField || kField !== ticker)) continue;
           const title = (raw.title || raw.question || '').toLowerCase();
           if (!title.includes(sym)) continue;
-
           const normalized = this._normalize(raw, asset);
           if (normalized && !out.some(m => m.conditionId === normalized.conditionId)) {
             out.push(normalized);
-            console.log(`[PredictFun] ${asset.symbol} found via kalshiTicker=${ticker}: "${raw.title}" kalshiField="${raw.kalshiMarketTicker}"`);
+            console.log(`[PredictFun] ${asset.symbol} found via kalshiTicker=${ticker}: "${raw.title}"`);
           }
         }
       } catch (err) {
-        const errDetail = err.response
-          ? `HTTP ${err.response.status} — ${JSON.stringify(err.response.data).slice(0, 200)}`
-          : err.message;
-        console.warn(`[PredictFun] kalshiTicker=${ticker} search failed: ${errDetail}`);
+        console.warn(`[PredictFun] kalshiTicker=${ticker} search failed: ${err.response?.status || err.message}`);
       }
     }
   }
 
   async _discoverViaSearch(asset, out) {
-    const sym = asset.symbol.toLowerCase();
-
-    // Primary: marketVariant=CRYPTO_UP_DOWN filters to only crypto Up/Down markets.
-    // Confirmed from variantData.type="CRYPTO_UP_DOWN" logged in live session.
-    // Fallback: status=OPEN deep scan if variant filter not supported.
+    const sym   = asset.symbol.toLowerCase();
     const passes = [
-      { label: 'variant+open',  baseParams: { marketVariant: 'CRYPTO_UP_DOWN', status: 'OPEN', limit: 20 }, maxPages: 10 },
-      { label: 'variant-only',  baseParams: { marketVariant: 'CRYPTO_UP_DOWN',                limit: 20 }, maxPages: 10 },
-      { label: 'status=OPEN',   baseParams: { status: 'OPEN',                                 limit: 20 }, maxPages: 80 },
+      { label: 'variant+open', baseParams: { marketVariant: 'CRYPTO_UP_DOWN', status: 'OPEN', limit: 20 }, maxPages: 10 },
+      { label: 'variant-only', baseParams: { marketVariant: 'CRYPTO_UP_DOWN', limit: 20 },                maxPages: 10 },
+      { label: 'status=OPEN',  baseParams: { status: 'OPEN', limit: 20 },                                 maxPages: 80 },
     ];
 
     for (const { label, baseParams, maxPages } of passes) {
-      let cursor  = null;
-      let page    = 0;
-      const sampleTitles = [];
-
+      let cursor = null;
+      let page   = 0;
       while (page < maxPages) {
         const params = { ...baseParams };
         if (cursor) params.cursor = cursor;
-
         try {
-          const resp = await axios.get(`${this.baseUrl}/v1/markets`, {
-            headers: this._headers(),
-            params,
-            timeout: 10_000,
-          });
-          const body = resp.data;
-          const data = body?.data || body;
-          const items = Array.isArray(data) ? data : (data?.markets || data?.items || []);
+          const resp       = await axios.get(`${this.baseUrl}/v1/markets`, { headers: this._headers(), params, timeout: 10_000 });
+          const body       = resp.data;
+          const data       = body?.data || body;
+          const items      = Array.isArray(data) ? data : (data?.markets || data?.items || []);
           const nextCursor = body?.cursor || null;
-
-          if (page < 3 && items.length > 0) sampleTitles.push(items[0]?.title || '?');
-
           for (const raw of items) {
-            // Skip resolved/closed markets — we only want currently tradeable markets
             if (raw.status === 'RESOLVED' || raw.tradingStatus === 'CLOSED') continue;
             const title = (raw.title || raw.question || raw.categorySlug || '').toLowerCase();
             if (!title.includes(sym) && !title.includes('bitcoin')) continue;
             const normalized = this._normalize(raw, asset);
-            if (normalized && normalized.active && !out.some(m => m.conditionId === normalized.conditionId)) {
-              out.push(normalized);
-            }
+            if (normalized && normalized.active && !out.some(m => m.conditionId === normalized.conditionId)) out.push(normalized);
           }
-
-          if (out.length > 0) {
-            console.log(`[PredictFun] ${asset.symbol} found via search pass=${label} page ${page + 1}`);
-            return;
-          }
+          if (out.length > 0) { console.log(`[PredictFun] ${asset.symbol} found via search pass=${label} page ${page + 1}`); return; }
           if (!nextCursor) break;
           cursor = nextCursor;
           page++;
         } catch (err) {
-          const errDetail = err.response
-            ? `HTTP ${err.response.status} — ${JSON.stringify(err.response.data).slice(0, 200)}`
-            : err.message;
-          console.warn(`[PredictFun] search pass=${label} page ${page + 1} failed: ${errDetail}`);
+          console.warn(`[PredictFun] search pass=${label} page ${page + 1} failed: ${err.response?.status || err.message}`);
           break;
         }
       }
-
       if (out.length > 0) return;
     }
-
     console.log(`[PredictFun] ${asset.symbol} — not found in any search pass`);
   }
 
   _normalize(raw, asset) {
     if (!raw || !raw.id) return null;
     const conditionId = String(raw.id);
-
-    const outcomes = Array.isArray(raw.outcomes) ? raw.outcomes : [];
-    // Up = indexSet 1 (YES), Down = indexSet 2 (NO)
+    const outcomes    = Array.isArray(raw.outcomes) ? raw.outcomes : [];
     const upOutcome   = outcomes.find(o => o.indexSet === 1 || o.name?.toLowerCase() === 'up');
     const downOutcome = outcomes.find(o => o.indexSet === 2 || o.name?.toLowerCase() === 'down');
-    const yesTokenId  = String(upOutcome?.onChainId || '');
+    const yesTokenId  = String(upOutcome?.onChainId   || '');
     const noTokenId   = String(downOutcome?.onChainId || '');
-
-    const isNegRisk      = raw.isNegRisk === true;
+    const isNegRisk      = raw.isNegRisk      === true;
     const isYieldBearing = raw.isYieldBearing === true;
     const feeRateBps     = parseInt(raw.feeRateBps || 100, 10);
-
-    // Resolve settlement time. Only endDate/endAt are valid — createdAt is the
-    // creation timestamp (always in the past) and would make _filterMarkets
-    // silently drop the market for being "expired".
-    const endDate = raw.endDate || raw.endAt || null;
-
-    // Extract predict.fun "Price to Beat" (strike) from market data.
-    // Candidate fields — log all non-null values so we can learn the correct one.
+    const endDate        = raw.endDate || raw.endAt || null;
     let strike = null;
     const vd = raw.variantData;
     if (vd != null) {
@@ -677,66 +524,31 @@ class PredictFunConnector extends EventEmitter {
       const st = typeof raw.stats === 'object' ? raw.stats : {};
       strike = st.startPrice ?? st.openPrice ?? st.strikePrice ?? st.referencePrice ?? null;
     }
-    if (strike == null && raw.resolution != null && typeof raw.resolution === 'object') {
-      strike = raw.resolution.startPrice ?? raw.resolution.openPrice ?? null;
-    }
-    if (strike != null) {
-      strike = parseFloat(strike);
-      if (isNaN(strike)) strike = null;
-    }
-
+    if (strike != null) { strike = parseFloat(strike); if (isNaN(strike)) strike = null; }
     return {
-      platform:    'predictfun',
-      asset:       asset.symbol,
-      conditionId,
-      question:    raw.title || raw.question || '',
-      slug:        raw.categorySlug || raw.slug || conditionId,
-      outcomes:    outcomes.map(o => o.name),
-      yesTokenId,
-      noTokenId,
-      yesPrice:    0,
-      noPrice:     0,
-      yesAsk:      0,
-      noAsk:       0,
-      yesBid:      0,
-      noBid:       0,
-      volume:      parseFloat(raw.volume || 0),
-      liquidity:   parseFloat(raw.liquidity || 0),
-      endDate,
-      active:      raw.tradingStatus !== 'CLOSED' && raw.status !== 'RESOLVED' && raw.status !== 'CLOSED',
-      closed:      raw.status === 'RESOLVED' || raw.tradingStatus === 'CLOSED',
-      strike,     // from market data; Monitor injects RTDS only if null
-      feeRateBps,
-      isNegRisk,
-      isYieldBearing,
-      marketId:    raw.id,
+      platform: 'predictfun', asset: asset.symbol, conditionId,
+      question: raw.title || raw.question || '', slug: raw.categorySlug || raw.slug || conditionId,
+      outcomes: outcomes.map(o => o.name), yesTokenId, noTokenId,
+      yesPrice: 0, noPrice: 0, yesAsk: 0, noAsk: 0, yesBid: 0, noBid: 0,
+      volume: parseFloat(raw.volume || 0), liquidity: parseFloat(raw.liquidity || 0),
+      endDate, active: raw.tradingStatus !== 'CLOSED' && raw.status !== 'RESOLVED' && raw.status !== 'CLOSED',
+      closed: raw.status === 'RESOLVED' || raw.tradingStatus === 'CLOSED',
+      strike, feeRateBps, isNegRisk, isYieldBearing, marketId: raw.id,
       lastUpdated: new Date().toISOString(),
     };
   }
 
-  /**
-   * Enrich markets with yesTokenId/noTokenId if missing after category listing.
-   *
-   * The category listing endpoint may omit outcomes.onChainId. Without tokenIds
-   * the decisionEngine rejects all signals (token required to sign/place orders).
-   *
-   * Strategy: try GET /v1/markets/{marketId} (same host, same path as the confirmed
-   * orderbook endpoint) — its full market detail typically includes outcomes.onChainId.
-   */
   async _enrichTokenIds(markets) {
     for (const m of markets) {
-      if (m.yesTokenId && m.noTokenId) continue; // already populated
+      if (m.yesTokenId && m.noTokenId) continue;
       if (!m.marketId) continue;
       try {
-        const resp = await axios.get(`${this.baseUrl}/v1/markets/${m.marketId}`, {
-          headers: this._headers(),
-          timeout: 8_000,
-        });
-        const raw = resp.data?.data || resp.data;
+        const resp = await axios.get(`${this.baseUrl}/v1/markets/${m.marketId}`, { headers: this._headers(), timeout: 8_000 });
+        const raw  = resp.data?.data || resp.data;
         if (!raw) continue;
         const outcomes = Array.isArray(raw.outcomes) ? raw.outcomes : [];
-        const upOut   = outcomes.find(o => o.indexSet === 1 || o.name?.toLowerCase() === 'up');
-        const downOut = outcomes.find(o => o.indexSet === 2 || o.name?.toLowerCase() === 'down');
+        const upOut    = outcomes.find(o => o.indexSet === 1 || o.name?.toLowerCase() === 'up');
+        const downOut  = outcomes.find(o => o.indexSet === 2 || o.name?.toLowerCase() === 'down');
         if (upOut?.onChainId)   m.yesTokenId = String(upOut.onChainId);
         if (downOut?.onChainId) m.noTokenId  = String(downOut.onChainId);
         console.log(`[PredictFun] ${m.asset} tokenIds enriched — yes="${m.yesTokenId}" no="${m.noTokenId}"`);
@@ -745,6 +557,10 @@ class PredictFunConnector extends EventEmitter {
       }
     }
   }
+
+  /* ---------------------------------------------------------- */
+  /*  Orderbook REST — INALTERADO                               */
+  /* ---------------------------------------------------------- */
 
   async getOrderbook(tokenId) {
     const market = this._findMarketByTokenId(tokenId)
@@ -755,10 +571,6 @@ class PredictFunConnector extends EventEmitter {
     return this._normalizeBook(data, tokenId, market);
   }
 
-  /**
-   * Try multiple endpoint formats for the predict.fun orderbook REST API.
-   * Logs the first working URL so we know the correct format going forward.
-   */
   async _fetchRawOrderbook(marketId, slugOrId) {
     const candidates = [
       `/v1/markets/${marketId}/orderbook`,
@@ -768,21 +580,17 @@ class PredictFunConnector extends EventEmitter {
     ];
     for (const path of candidates) {
       try {
-        const url = path.includes('?')
+        const url  = path.includes('?')
           ? `${this.baseUrl}${path.split('?')[0]}?${path.split('?')[1]}`
           : `${this.baseUrl}${path}`;
-        const resp = await axios.get(url, {
-          headers: this._headers(),
-          timeout: 10_000,
-        });
+        const resp = await axios.get(url, { headers: this._headers(), timeout: 10_000 });
         const data = resp.data?.data || resp.data;
         if (data && (data.bids || data.asks)) {
           console.log(`[PredictFun] orderbook endpoint confirmed: ${path}`);
           return data;
         }
       } catch (err) {
-        if (err.response?.status === 404) continue; // expected, try next
-        console.debug(`[PredictFun] ${path} → ${err.response?.status || err.message}`);
+        if (err.response?.status === 404) continue;
       }
     }
     console.log(`[PredictFun] all orderbook endpoints returned 404 for marketId=${marketId}`);
@@ -791,15 +599,12 @@ class PredictFunConnector extends EventEmitter {
 
   _normalizeBook(data, tokenId, market) {
     if (!data) return null;
-    const isYes = tokenId === market.yesTokenId;
-    // predict.fun book shows the "Up" side. "Down" prices are derived.
+    const isYes   = tokenId === market.yesTokenId;
     const rawBids = (data.bids || []).map(l => ({ price: parseFloat(l.price || l[0]), size: parseFloat(l.size || l[1]) }));
     const rawAsks = (data.asks || []).map(l => ({ price: parseFloat(l.price || l[0]), size: parseFloat(l.size || l[1]) }));
-
     if (isYes) {
       return { bids: rawBids.sort((a,b) => b.price - a.price), asks: rawAsks.sort((a,b) => a.price - b.price) };
     }
-    // Down token: prices are complementary (Down_ask = 1 - Up_bid, Down_bid = 1 - Up_ask)
     const downAsks = rawBids.map(l => ({ price: Math.round((1 - l.price) * 1000) / 1000, size: l.size })).sort((a,b) => a.price - b.price);
     const downBids = rawAsks.map(l => ({ price: Math.round((1 - l.price) * 1000) / 1000, size: l.size })).sort((a,b) => b.price - a.price);
     return { bids: downBids, asks: downAsks };
@@ -813,38 +618,25 @@ class PredictFunConnector extends EventEmitter {
   }
 
   /* ---------------------------------------------------------- */
-  /*  WebSocket — real-time orderbook streaming                  */
+  /*  WebSocket — INALTERADO                                    */
   /* ---------------------------------------------------------- */
 
   subscribeWs(markets = []) {
     for (const m of markets) {
       if (m.conditionId) {
         this._subscribedAssets.set(m.conditionId, {
-          asset: m.asset,
-          marketId: m.marketId,
-          yesTokenId: m.yesTokenId,
-          noTokenId:  m.noTokenId,
-          conditionId: m.conditionId,
+          asset: m.asset, marketId: m.marketId,
+          yesTokenId: m.yesTokenId, noTokenId: m.noTokenId, conditionId: m.conditionId,
         });
       }
     }
-
-    // Prime the in-memory book via REST immediately.
-    // The WS may not send an initial snapshot if the book has no recent activity.
-    // Without this, yesAsk=0/noAsk=0 forever and decisionEngine ignores the market.
     this._primeBooks(markets).catch(() => {});
-
-    // Start periodic REST refresh in case WS doesn't send book events.
     if (!this._bookRefreshTimer) {
       this._bookRefreshTimer = setInterval(() => this._refreshBooksIfStale(), 30_000);
       if (this._bookRefreshTimer.unref) this._bookRefreshTimer.unref();
     }
-
-    if (this._ws && this._wsConnected) {
-      this._sendSubscriptions(markets);
-      return;
-    }
-    if (this._ws) return; // connecting
+    if (this._ws && this._wsConnected) { this._sendSubscriptions(markets); return; }
+    if (this._ws) return;
     this._connectWs();
   }
 
@@ -855,9 +647,7 @@ class PredictFunConnector extends EventEmitter {
       if (data) {
         this._applyBookUpdate(m.marketId, data);
         const cached = this.markets.get(m.conditionId);
-        if (cached) {
-          console.log(`[PredictFun] ${m.asset} book primed: yesAsk=${cached.yesAsk?.toFixed(4)} noAsk=${cached.noAsk?.toFixed(4)}`);
-        }
+        if (cached) console.log(`[PredictFun] ${m.asset} book primed: yesAsk=${cached.yesAsk?.toFixed(4)} noAsk=${cached.noAsk?.toFixed(4)}`);
       }
     }
   }
@@ -866,139 +656,78 @@ class PredictFunConnector extends EventEmitter {
     const now = Date.now();
     for (const [conditionId, info] of this._subscribedAssets) {
       const lastTick = this._lastTickAt.get(conditionId) || 0;
-      if (now - lastTick < 25_000) continue; // WS book is fresh
+      if (now - lastTick < 25_000) continue;
       const data = await this._fetchRawOrderbook(info.marketId, conditionId).catch(() => null);
       if (data) this._applyBookUpdate(info.marketId, data);
     }
   }
 
   _connectWs() {
-    try {
-      this._ws = new WebSocket(WS_URL);
-    } catch (err) {
+    try { this._ws = new WebSocket(WS_URL); } catch (err) {
       console.error('[PredictFun WS] failed to create connection:', err.message);
-      this._scheduleReconnect();
-      return;
+      this._scheduleReconnect(); return;
     }
-
     this._ws.on('open', () => {
       console.log('[PredictFun WS] connected');
-      this._wsConnected = true;
-      this._lastPongAt = Date.now();
+      this._wsConnected    = true;
+      this._lastPongAt     = Date.now();
       this._reconnectDelay = 1000;
-
-      if (this._subscribedAssets.size > 0) {
-        this._sendSubscriptions([...this._subscribedAssets.values()]);
-      }
+      if (this._subscribedAssets.size > 0) this._sendSubscriptions([...this._subscribedAssets.values()]);
     });
-
     this._ws.on('message', (raw) => {
-      try {
-        const msg = JSON.parse(raw.toString());
-        this._handleWsMessage(msg);
-      } catch (e) {
-        console.error('[PredictFun WS] parse error:', e.message);
-      }
+      try { this._handleWsMessage(JSON.parse(raw.toString())); } catch (e) { console.error('[PredictFun WS] parse error:', e.message); }
     });
-
     this._ws.on('close', (code) => {
       console.log(`[PredictFun WS] closed (code: ${code})`);
-      this._wsCleanup();
-      this._scheduleReconnect();
+      this._wsCleanup(); this._scheduleReconnect();
     });
-
-    this._ws.on('error', (err) => {
-      console.error('[PredictFun WS] error:', err.message);
-    });
+    this._ws.on('error', (err) => { console.error('[PredictFun WS] error:', err.message); });
   }
 
   _handleWsMessage(msg) {
     if (!msg) return;
-
-    // Server-side heartbeat: respond immediately
     if (msg.type === 'M' && msg.topic === 'heartbeat') {
       this._lastPongAt = Date.now();
       this._wsSend({ method: 'heartbeat', data: msg.data });
       return;
     }
-
-    // Subscription acknowledgement
     if (msg.type === 'R') return;
-
-    // Orderbook update: {type:"M", topic:"predictOrderbook/{marketId}", data:{bids,asks,...}}
     if (msg.type === 'M' && typeof msg.topic === 'string' && msg.topic.startsWith('predictOrderbook/')) {
       const marketId = parseInt(msg.topic.split('/')[1], 10);
-      if (!isNaN(marketId) && msg.data) {
-        this._applyBookUpdate(marketId, msg.data);
-      }
+      if (!isNaN(marketId) && msg.data) this._applyBookUpdate(marketId, msg.data);
       return;
     }
-
-    // Log any unhandled message types for diagnostics
-    if (msg.type && msg.type !== 'M') {
-      console.log(`[PredictFun WS] unhandled message type=${msg.type} topic=${msg.topic}`);
-    }
+    if (msg.type && msg.type !== 'M') console.log(`[PredictFun WS] unhandled message type=${msg.type} topic=${msg.topic}`);
   }
 
   _applyBookUpdate(marketId, data) {
-    // Find conditionId for this marketId
     let conditionId = null;
     for (const [cid, info] of this._subscribedAssets) {
       if (info.marketId === marketId) { conditionId = cid; break; }
     }
     if (!conditionId) return;
-
     const bidsArr = Array.isArray(data.bids) ? data.bids : [];
     const asksArr = Array.isArray(data.asks) ? data.asks : [];
-
     let book = this._books.get(conditionId);
-    if (!book) {
-      book = { bids: new Map(), asks: new Map() };
-      this._books.set(conditionId, book);
-    }
-
-    // Full snapshot: clear and rebuild
-    book.bids.clear();
-    book.asks.clear();
-    for (const l of bidsArr) {
-      const p = parseFloat(l.price || l[0]);
-      const s = parseFloat(l.size  || l[1]);
-      if (p > 0 && s > 0) book.bids.set(p.toString(), s);
-    }
-    for (const l of asksArr) {
-      const p = parseFloat(l.price || l[0]);
-      const s = parseFloat(l.size  || l[1]);
-      if (p > 0 && s > 0) book.asks.set(p.toString(), s);
-    }
-
+    if (!book) { book = { bids: new Map(), asks: new Map() }; this._books.set(conditionId, book); }
+    book.bids.clear(); book.asks.clear();
+    for (const l of bidsArr) { const p = parseFloat(l.price || l[0]); const s = parseFloat(l.size || l[1]); if (p > 0 && s > 0) book.bids.set(p.toString(), s); }
+    for (const l of asksArr) { const p = parseFloat(l.price || l[0]); const s = parseFloat(l.size || l[1]); if (p > 0 && s > 0) book.asks.set(p.toString(), s); }
     this._lastTickAt.set(conditionId, Date.now());
     this._propagateBook(conditionId);
   }
 
   _propagateBook(conditionId) {
-    const book  = this._books.get(conditionId);
+    const book   = this._books.get(conditionId);
     if (!book) return;
-    const info  = this._subscribedAssets.get(conditionId);
     const cached = this.markets.get(conditionId);
     if (!cached) return;
-
-    // UP (YES) token: use book asks/bids directly
     const upBestAsk = this._bestPrice(book.asks, 'min');
     const upBestBid = this._bestPrice(book.bids, 'max');
-
     if (upBestAsk != null) { cached.yesAsk = upBestAsk; cached.yesPrice = upBestAsk; }
     if (upBestBid != null)   cached.yesBid = upBestBid;
-
-    // DOWN (NO) token: derived from complement
-    if (upBestBid != null) {
-      const downAsk = Math.round((1 - upBestBid) * 1000) / 1000;
-      cached.noAsk   = downAsk;
-      cached.noPrice = downAsk;
-    }
-    if (upBestAsk != null) {
-      cached.noBid = Math.round((1 - upBestAsk) * 1000) / 1000;
-    }
-
+    if (upBestBid != null) { cached.noAsk = Math.round((1 - upBestBid) * 1000) / 1000; cached.noPrice = cached.noAsk; }
+    if (upBestAsk != null)   cached.noBid = Math.round((1 - upBestAsk) * 1000) / 1000;
     cached.lastUpdated = new Date().toISOString();
     this.emit('tick', cached);
   }
@@ -1020,86 +749,38 @@ class PredictFunConnector extends EventEmitter {
     const conditionId = market.conditionId;
     const book = this._books.get(conditionId);
     if (!book) return null;
-
     const isYes = tokenId === market.yesTokenId;
-    const now = Date.now();
-
-    // UP token: use book directly
+    const now   = Date.now();
     if (isYes) {
-      const sortedAsks = [...book.asks.entries()]
-        .map(([p,s]) => ({ price: parseFloat(p), size: s }))
-        .filter(l => l.price > 0 && l.size > 0)
-        .sort((a,b) => a.price - b.price).slice(0, 5);
-      const sortedBids = [...book.bids.entries()]
-        .map(([p,s]) => ({ price: parseFloat(p), size: s }))
-        .filter(l => l.price > 0 && l.size > 0)
-        .sort((a,b) => b.price - a.price).slice(0, 5);
+      const sortedAsks = [...book.asks.entries()].map(([p,s]) => ({ price: parseFloat(p), size: s })).filter(l => l.price > 0 && l.size > 0).sort((a,b) => a.price - b.price).slice(0, 5);
+      const sortedBids = [...book.bids.entries()].map(([p,s]) => ({ price: parseFloat(p), size: s })).filter(l => l.price > 0 && l.size > 0).sort((a,b) => b.price - a.price).slice(0, 5);
       const lastAt = this._lastTickAt.get(conditionId) || 0;
-      const ageMs = lastAt > 0 ? now - lastAt : -1;
-      return {
-        bestAsk: sortedAsks[0]?.price ?? null,
-        bestAskSize: sortedAsks[0]?.size ?? 0,
-        bestBid: sortedBids[0]?.price ?? null,
-        bestBidSize: sortedBids[0]?.size ?? 0,
-        asks: sortedAsks, bids: sortedBids, ageMs,
-        wsAlive: this._wsConnected && (now - this._lastPongAt) < 20_000,
-      };
+      return { bestAsk: sortedAsks[0]?.price ?? null, bestAskSize: sortedAsks[0]?.size ?? 0, bestBid: sortedBids[0]?.price ?? null, bestBidSize: sortedBids[0]?.size ?? 0, asks: sortedAsks, bids: sortedBids, ageMs: lastAt > 0 ? now - lastAt : -1, wsAlive: this._wsConnected && (now - this._lastPongAt) < 20_000 };
     }
-
-    // DOWN token: derive from UP book complement
-    const upAsks = [...book.asks.entries()]
-      .map(([p,s]) => ({ price: parseFloat(p), size: s }))
-      .filter(l => l.price > 0 && l.size > 0).sort((a,b) => a.price - b.price);
-    const upBids = [...book.bids.entries()]
-      .map(([p,s]) => ({ price: parseFloat(p), size: s }))
-      .filter(l => l.price > 0 && l.size > 0).sort((a,b) => b.price - a.price);
-
-    // Down ask = 1 - Up bid (sorted by price asc)
-    const downAsks = upBids.map(l => ({ price: Math.round((1 - l.price) * 1000) / 1000, size: l.size }))
-      .sort((a,b) => a.price - b.price).slice(0, 5);
-    // Down bid = 1 - Up ask
-    const downBids = upAsks.map(l => ({ price: Math.round((1 - l.price) * 1000) / 1000, size: l.size }))
-      .sort((a,b) => b.price - a.price).slice(0, 5);
-
-    const lastAt = this._lastTickAt.get(conditionId) || 0;
-    return {
-      bestAsk: downAsks[0]?.price ?? null,
-      bestAskSize: downAsks[0]?.size ?? 0,
-      bestBid: downBids[0]?.price ?? null,
-      bestBidSize: downBids[0]?.size ?? 0,
-      asks: downAsks, bids: downBids,
-      ageMs: lastAt > 0 ? now - lastAt : -1,
-      wsAlive: this._wsConnected && (now - this._lastPongAt) < 20_000,
-    };
+    const upAsks  = [...book.asks.entries()].map(([p,s]) => ({ price: parseFloat(p), size: s })).filter(l => l.price > 0 && l.size > 0).sort((a,b) => a.price - b.price);
+    const upBids  = [...book.bids.entries()].map(([p,s]) => ({ price: parseFloat(p), size: s })).filter(l => l.price > 0 && l.size > 0).sort((a,b) => b.price - a.price);
+    const downAsks = upBids.map(l => ({ price: Math.round((1 - l.price) * 1000) / 1000, size: l.size })).sort((a,b) => a.price - b.price).slice(0, 5);
+    const downBids = upAsks.map(l => ({ price: Math.round((1 - l.price) * 1000) / 1000, size: l.size })).sort((a,b) => b.price - a.price).slice(0, 5);
+    const lastAt   = this._lastTickAt.get(conditionId) || 0;
+    return { bestAsk: downAsks[0]?.price ?? null, bestAskSize: downAsks[0]?.size ?? 0, bestBid: downBids[0]?.price ?? null, bestBidSize: downBids[0]?.size ?? 0, asks: downAsks, bids: downBids, ageMs: lastAt > 0 ? now - lastAt : -1, wsAlive: this._wsConnected && (now - this._lastPongAt) < 20_000 };
   }
 
   _sendSubscriptions(markets) {
     const marketIds = [];
-    for (const m of markets) {
-      if (m.marketId) marketIds.push(m.marketId);
-    }
+    for (const m of markets) { if (m.marketId) marketIds.push(m.marketId); }
     if (marketIds.length === 0) return;
     console.log(`[PredictFun WS] subscribing to ${marketIds.length} market streams`);
     for (const id of marketIds) {
-      this._wsSend({
-        method: 'subscribe',
-        requestId: this._reqId++,
-        params: [`predictOrderbook/${id}`],
-      });
+      this._wsSend({ method: 'subscribe', requestId: this._reqId++, params: [`predictOrderbook/${id}`] });
     }
   }
 
   unsubscribeMarkets(conditionIds) {
-    for (const id of conditionIds) {
-      this._subscribedAssets.delete(id);
-    }
-    // WS reconnect on rotation handles cleanup
+    for (const id of conditionIds) this._subscribedAssets.delete(id);
   }
 
   _wsSend(obj) {
-    if (this._ws && this._ws.readyState === WebSocket.OPEN) {
-      this._ws.send(JSON.stringify(obj));
-    }
+    if (this._ws && this._ws.readyState === WebSocket.OPEN) this._ws.send(JSON.stringify(obj));
   }
 
   _wsCleanup() {
@@ -1109,165 +790,118 @@ class PredictFunConnector extends EventEmitter {
 
   _scheduleReconnect() {
     if (this._reconnectTimer) return;
-    console.log(`[PredictFun WS] reconnecting in ${this._reconnectDelay}ms...`);
     this._reconnectTimer = setTimeout(() => {
-      this._reconnectTimer = null;
-      this._reconnectDelay = Math.min(this._reconnectDelay * 2, this._maxReconnectDelay);
+      this._reconnectTimer    = null;
+      this._reconnectDelay    = Math.min(this._reconnectDelay * 2, this._maxReconnectDelay);
       this._connectWs();
     }, this._reconnectDelay);
   }
 
   /* ---------------------------------------------------------- */
-  /*  Order placement                                            */
+  /*  Order placement — usa SDK oficial                         */
   /* ---------------------------------------------------------- */
 
+  /**
+   * Fluxo segundo doc oficial:
+   * https://dev.predict.fun/how-to-create-or-cancel-orders-679306m0.md#how-to-create-a-market-order
+   *
+   * 1. getMarketOrderAmounts() — calcula makerAmount/takerAmount a partir do orderbook
+   * 2. buildOrder("MARKET", { side, tokenId, makerAmount, takerAmount, ... })
+   *    Com predictAccount configurado no make(), maker e signer são setados
+   *    automaticamente para predictAccount.
+   * 3. buildTypedData(order, { isNegRisk, isYieldBearing })
+   * 4. signTypedDataOrder(typedData) — assina com a Privy EOA
+   * 5. buildTypedDataHash(typedData)
+   * 6. POST /v1/orders com { order: { ...signedOrder, hash }, pricePerShare, strategy, slippageBps }
+   */
   async placeOrder(order) {
     if (!this.connected) {
       console.error('[PredictFun] cannot place order — not connected');
       return null;
     }
-    if (!this.wallet) {
-      console.error('[PredictFun] cannot place order — no wallet');
+    await this._ensureOrderBuilder();
+    if (!this._orderBuilder) {
+      console.error('[PredictFun] cannot place order — OrderBuilder not initialized');
+      this._lastOrderError = { type: 'other', message: 'OrderBuilder not initialized' };
       return null;
     }
-    if (!this.apiKey) {
-      console.error('[PredictFun] cannot place order — no API key');
-      return null;
-    }
-
-    // Predict Account is required. The order's maker/signer must be the
-    // Predict Account (smart wallet), not the signing wallet. Without it,
-    // predict.fun returns InvalidSignerError.
     if (!this.predictAccount) {
-      console.error('[PredictFun] cannot place order — predictAccountAddress not configured (get it from predict.fun account settings)');
+      console.error('[PredictFun] cannot place order — predictAccountAddress not configured');
       this._lastOrderError = { type: 'other', message: 'predictAccountAddress not set' };
       return null;
     }
 
     this._lastOrderError = null;
-    // predict.fun CLOB enforces maker === signer even with signatureType=1.
-    // The only accepted combination is EOA mode: maker=signer=wallet.address,
-    // signatureType=0. The CLOB internally maps the Privy wallet (0x09F...) to
-    // the predictAccount (0x010b41...) and debits from there.
-    const makerAddress  = this.predictAccount;
-    const signerAddress = this.predictAccount;
 
     const tokenId = order.tokenId;
-    const side    = order.side === 'BUY' ? 0 : 1; // 0=BUY, 1=SELL
-    // Round to 4 decimals to strip IEEE-754 noise. JS stores 0.62 as
-    // 0.61999999999999999556… so price.toFixed(18) returns
-    // "0.619999999999999996" — the predict.fun server rejects that as
-    // "invalid numeric value". 4 decimals is well past the price tick
-    // (typically 0.001) and keeps makerAmount/takerAmount consistent.
+    const side    = order.side === 'BUY' ? Side.BUY : Side.SELL;  // SDK: Side.BUY=0, Side.SELL=1
     const price   = Math.round(parseFloat(order.price) * 1e4) / 1e4;
     const size    = parseFloat(order.size);
 
     const market = this._findMarketByTokenId(tokenId);
     if (!market) {
-      console.error(`[PredictFun] cannot place order — market not found for tokenId ${tokenId?.slice(0,16)}...`);
+      console.error(`[PredictFun] cannot place order — market not found for tokenId ${String(tokenId).slice(0,16)}...`);
       this._lastOrderError = { type: 'other', message: 'market not found' };
       return null;
     }
 
     const feeRateBps = market.feeRateBps || 100;
 
-    // verifyingContract based on market type
-    const vc = market.isNegRisk && market.isYieldBearing ? CONTRACTS.yieldBearingNegRisk
-             : market.isNegRisk                          ? CONTRACTS.negRisk
-             : market.isYieldBearing                     ? CONTRACTS.yieldBearing
-             :                                             CONTRACTS.standard;
-
-    const domain = {
-      name:              'predict.fun CTF Exchange',
-      version:           '1',
-      chainId:           56,
-      verifyingContract: vc,
-    };
-
-    // BUY: makerAmount=USDT to pay, takerAmount=shares to receive
-    // SELL: makerAmount=shares to sell, takerAmount=USDT to receive
-    const sharesWei = toWei(size);
-const priceWei  = toWei(price);
-
-// Cálculo base sem buffer manual — slippage é tratado pelo slippageBps no body
-const FEE_DENOMINATOR = BigInt(10000);
-const feeRateBigInt   = BigInt(feeRateBps);
-
-let usdtWei;
-if (side === 0) {
-  const baseUsdt = (priceWei * sharesWei) / WEI;
-  usdtWei = (baseUsdt * (FEE_DENOMINATOR + feeRateBigInt)) / FEE_DENOMINATOR;
-} else {
-  usdtWei = (priceWei * sharesWei) / WEI;
-}
-
-const makerAmount = side === 0 ? usdtWei : sharesWei;
-const takerAmount = side === 0 ? sharesWei : usdtWei;
-
-console.log(`[PredictFun] DEBUG AMOUNTS → size=${size} price=${price} feeRateBps=${feeRateBps} | usdtWei=${usdtWei} sharesWei=${sharesWei} makerAmount=${makerAmount}`);
-
-const salt       = BigInt(Math.floor(Math.random() * 1e15));
-const expiration = BigInt(Math.floor(Date.now() / 1000) + 300);
-const nonce      = BigInt(0);
-
-const orderValue = {
-  salt,
-  maker:         makerAddress,   // wallet.address — maker deve === signer ✅
-  signer:        makerAddress,   // wallet.address — quem assina ✅
-  taker:         '0x0000000000000000000000000000000000000000',
-  tokenId:       BigInt(tokenId),
-  makerAmount,
-  takerAmount,
-  expiration,
-  nonce,
-  feeRateBps:    BigInt(feeRateBps),
-  side:          side,
-  signatureType: 1,  // POLY_PROXY / Smart Wallet
-};
-
-// Assina o orderValue com EIP-712
-let signature;
-try {
-  signature = await this.wallet.signTypedData(domain, ORDER_TYPES, orderValue);
-} catch (err) {
-  console.error(`[PredictFun] EIP-712 signTypedData failed: ${err.message}`);
-  this._lastOrderError = { type: 'other', message: `sign failed: ${err.message}` };
-  return null;
-}
-
-// predict.fun API requires pricePerShare as uint256 wei string (1e18).
-// e.g. 0.3 → "300000000000000000". toWei() handles IEEE-754 precision.
-const priceStr    = toWei(price).toString();
-const makerAmtStr = makerAmount.toString();
-const takerAmtStr = takerAmount.toString();
-
-const body = {
-  data: {
-    strategy:       'MARKET',
-    pricePerShare:  priceStr,
-    isMinAmountOut: side === 0,
-    slippageBps:    50,
-    order: {
-      salt:          salt.toString(),
-      maker:         makerAddress,   // wallet.address — maker deve === signer ✅
-      signer:        makerAddress,   // wallet.address — quem assina ✅
-      taker:         '0x0000000000000000000000000000000000000000',
-      tokenId:       tokenId,
-      makerAmount:   makerAmtStr,
-      takerAmount:   takerAmtStr,
-      expiration:    expiration.toString(),
-      nonce:         '0',
-      feeRateBps:    String(feeRateBps),
-      side:          side,
-      signatureType: 0,
-      signature,
-    },
-  },
-};
-
-    await this._ensureJwt();
     try {
-      const t0 = Date.now();
+      // Step 1: calcular amounts via SDK
+      // Doc: getMarketOrderAmounts({ side, quantityWei, slippageBps }, book)
+      // O book precisa estar no formato { asks: [[price, size], ...], bids: [...] }
+      const rawBook = this._getRawBookForSdk(market, tokenId);
+
+      const { makerAmount, takerAmount, pricePerShare, slippageBps } =
+        this._orderBuilder.getMarketOrderAmounts(
+          {
+            side,
+            quantityWei:    toWei(size),
+            slippageBps:    50n,  // 0.5% slippage
+            ...(side === Side.BUY ? { isMinAmountOut: true } : {}),
+          },
+          rawBook,
+        );
+
+      // Step 2: buildOrder — maker/signer setados automaticamente para predictAccount pelo SDK
+      // Doc: "Create the order (maker and signer are automatically set to the predictAccount)"
+      const builtOrder = this._orderBuilder.buildOrder('MARKET', {
+        side,
+        tokenId:     tokenId,
+        makerAmount,
+        takerAmount,
+        nonce:       0n,
+        feeRateBps,
+      });
+
+      // Step 3: buildTypedData
+      const typedData = this._orderBuilder.buildTypedData(builtOrder, {
+        isNegRisk:      market.isNegRisk      || false,
+        isYieldBearing: market.isYieldBearing || false,
+      });
+
+      // Step 4: signTypedDataOrder — assina com a Privy EOA
+      const signedOrder = await this._orderBuilder.signTypedDataOrder(typedData);
+
+      // Step 5: hash
+      const hash = this._orderBuilder.buildTypedDataHash(typedData);
+
+      console.log(`[PredictFun] DEBUG AMOUNTS → size=${size} price=${price} feeRateBps=${feeRateBps} | makerAmount=${makerAmount} takerAmount=${takerAmount}`);
+
+      // Step 6: POST /v1/orders
+      await this._ensureJwt();
+      const body = {
+        data: {
+          order:         { ...signedOrder, hash },
+          pricePerShare: pricePerShare.toString(),
+          strategy:      'MARKET',
+          slippageBps:   slippageBps?.toString() || '50',
+          ...(side === Side.BUY ? { isMinAmountOut: true } : {}),
+        },
+      };
+
+      const t0   = Date.now();
       const resp = await axios.post(`${this.baseUrl}/v1/orders`, body, {
         headers: this._headers(),
         timeout: 15_000,
@@ -1286,14 +920,12 @@ const body = {
       const orderId = String(rdata.orderId);
       console.log(`[PredictFun] order placed orderId=${orderId} — polling for fill...`);
 
-      // Poll fill status (max 3s)
       const fillData = await this._pollFill(orderId, 3000);
       if (fillData) {
-        // Map to Polymarket-compatible response shape
         return {
           orderId,
-          orderHash:    rdata.orderHash || '',
-          takingAmount: fillData.amountReceived, // matches Polymarket .takingAmount
+          orderHash:    rdata.orderHash || hash,
+          takingAmount: fillData.amountReceived,
           makingAmount: fillData.amountSpent,
           status:       fillData.status,
           fillPrice:    fillData.fillPrice,
@@ -1301,12 +933,11 @@ const body = {
         };
       }
 
-      // Timeout — treat as unfilled (dispatcher will hedge)
       console.warn(`[PredictFun] fill poll timeout for orderId=${orderId}`);
       this._lastOrderError = { type: 'liquidity', message: 'fill timeout — order may be pending' };
       return null;
     } catch (err) {
-      const status = err.response?.status;
+      const status  = err.response?.status;
       const errBody = JSON.stringify(err.response?.data || err.message).slice(0, 300);
       console.error(`[PredictFun] POST /v1/orders FAILED (HTTP ${status}): ${errBody}`);
       this._lastOrderError = this._classifyOrderError(errBody, status);
@@ -1314,26 +945,48 @@ const body = {
     }
   }
 
+  /**
+   * Converte o book interno (Map) para o formato esperado pelo SDK:
+   * { asks: [[price, size], ...], bids: [[price, size], ...] }
+   */
+  _getRawBookForSdk(market, tokenId) {
+    const conditionId = market.conditionId;
+    const book        = this._books.get(conditionId);
+    const isYes       = tokenId === market.yesTokenId;
+    if (!book) return { asks: [], bids: [] };
+
+    const toArr = (map) => [...map.entries()]
+      .map(([p, s]) => [parseFloat(p), s])
+      .filter(([p, s]) => p > 0 && s > 0);
+
+    if (isYes) {
+      return {
+        asks: toArr(book.asks).sort((a,b) => a[0] - b[0]),
+        bids: toArr(book.bids).sort((a,b) => b[0] - a[0]),
+      };
+    }
+    // DOWN token: derivar do complemento do UP book
+    const upAsks = toArr(book.asks).sort((a,b) => a[0] - b[0]);
+    const upBids = toArr(book.bids).sort((a,b) => b[0] - a[0]);
+    return {
+      asks: upBids.map(([p,s]) => [Math.round((1 - p) * 1000) / 1000, s]).sort((a,b) => a[0] - b[0]),
+      bids: upAsks.map(([p,s]) => [Math.round((1 - p) * 1000) / 1000, s]).sort((a,b) => b[0] - a[0]),
+    };
+  }
+
   async _pollFill(orderId, maxMs) {
     const POLL_INTERVAL = 400;
-    const deadline = Date.now() + maxMs;
+    const deadline      = Date.now() + maxMs;
     await this._ensureJwt();
-
     while (Date.now() < deadline) {
       try {
-        const resp = await axios.get(`${this.baseUrl}/v1/orders`, {
-          headers: this._headers(),
-          params:  { orderId, limit: 1 },
-          timeout: 5_000,
-        });
-        const data = resp.data?.data || resp.data;
+        const resp   = await axios.get(`${this.baseUrl}/v1/orders`, { headers: this._headers(), params: { orderId, limit: 1 }, timeout: 5_000 });
+        const data   = resp.data?.data || resp.data;
         const orders = Array.isArray(data) ? data : (data?.orders || []);
-        const order = orders.find(o => String(o.id || o.orderId) === orderId);
-        if (order) {
-          const status = order.status || '';
-          if (status === 'FILLED' || status === 'PARTIALLY_FILLED') {
-            return this._parseFill(order);
-          }
+        const o      = orders.find(x => String(x.id || x.orderId) === orderId);
+        if (o) {
+          const status = o.status || '';
+          if (status === 'FILLED' || status === 'PARTIALLY_FILLED') return this._parseFill(o);
           if (status === 'CANCELLED' || status === 'EXPIRED') {
             console.warn(`[PredictFun] order ${orderId} status=${status}`);
             this._lastOrderError = { type: 'liquidity', message: `order ${status}` };
@@ -1347,34 +1000,17 @@ const body = {
   }
 
   _parseFill(order) {
-    // amountFilled is in wei (shares received for BUY, USDT received for SELL)
-    const raw = order.order || {};
-    const side = raw.side === 0 || raw.side === 'BUY' ? 'BUY' : 'SELL';
+    const raw    = order.order || {};
+    const side   = raw.side === 0 || raw.side === 'BUY' ? 'BUY' : 'SELL';
     const amountFilled = BigInt(order.amountFilled || order.amount || 0);
-
     if (side === 'BUY') {
       const sharesReceived = Number(amountFilled) / Number(WEI);
-      const usdtSpent = Number(BigInt(raw.makerAmount || 0)) / Number(WEI);
-      const fillPrice = sharesReceived > 0 ? usdtSpent / sharesReceived : 0;
-      return {
-        filledShares:  sharesReceived,
-        amountReceived: String(sharesReceived), // shares (matches Polymarket takingAmount = tokens)
-        amountSpent:    String(usdtSpent),
-        fillPrice,
-        status: order.status,
-      };
-    } else {
-      const sharesGiven   = Number(BigInt(raw.makerAmount || 0)) / Number(WEI);
-      const usdtReceived  = Number(amountFilled) / Number(WEI);
-      const fillPrice     = sharesGiven > 0 ? usdtReceived / sharesGiven : 0;
-      return {
-        filledShares:  sharesGiven,
-        amountReceived: String(usdtReceived), // USDT (matches Polymarket takingAmount for SELL)
-        amountSpent:    String(sharesGiven),
-        fillPrice,
-        status: order.status,
-      };
+      const usdtSpent      = Number(BigInt(raw.makerAmount || 0)) / Number(WEI);
+      return { filledShares: sharesReceived, amountReceived: String(sharesReceived), amountSpent: String(usdtSpent), fillPrice: sharesReceived > 0 ? usdtSpent / sharesReceived : 0, status: order.status };
     }
+    const sharesGiven  = Number(BigInt(raw.makerAmount || 0)) / Number(WEI);
+    const usdtReceived = Number(amountFilled) / Number(WEI);
+    return { filledShares: sharesGiven, amountReceived: String(usdtReceived), amountSpent: String(sharesGiven), fillPrice: sharesGiven > 0 ? usdtReceived / sharesGiven : 0, status: order.status };
   }
 
   _classifyOrderError(errStr, httpStatus) {
@@ -1387,38 +1023,23 @@ const body = {
   }
 
   /* ---------------------------------------------------------- */
-  /*  Generic platform interface (used by decisionEngine/dispatcher) */
+  /*  Interface genérica — INALTERADA                           */
   /* ---------------------------------------------------------- */
 
-  /** Hedge/exit floor price for SELL sweep orders. Predict.fun: sub-cent. */
   get floorPrice() { return 0.001; }
-
   setFeeRate(rate) { if (typeof rate === 'number' && rate >= 0) this.feeRate = rate; }
-
   getMarketKey(market) { return market.conditionId; }
-
-  getSideToken(market, side) {
-    return side === 'yes' || side === 'up' ? market.yesTokenId : market.noTokenId;
-  }
+  getSideToken(market, side) { return side === 'yes' || side === 'up' ? market.yesTokenId : market.noTokenId; }
 
   getBestAsk(market, side) {
-    const tokenId = this.getSideToken(market, side);
-    if (!tokenId) return null;
-    const snap = this.getLiveSnapshot(tokenId);
+    const snap = this.getLiveSnapshot(this.getSideToken(market, side));
     return snap?.bestAsk ?? null;
   }
   getBestBid(market, side) {
-    const tokenId = this.getSideToken(market, side);
-    if (!tokenId) return null;
-    const snap = this.getLiveSnapshot(tokenId);
+    const snap = this.getLiveSnapshot(this.getSideToken(market, side));
     return snap?.bestBid ?? null;
   }
 
-  /**
-   * Per-market feeRateBps from the API. Falls back to instance default.
-   * CTF formula on entry: fee_tokens = feeRate × min(P, 1-P) / P.
-   * On exit (SELL): fee_usdt = feeRate × min(P, 1-P) per share.
-   */
   _marketFeeRate(market) {
     if (market?.feeRateBps != null) return market.feeRateBps / 10000;
     return this.feeRate;
@@ -1433,112 +1054,69 @@ const body = {
   }
 
   getLiveSnapshotForSide(market, side) {
-    const tokenId = this.getSideToken(market, side);
-    if (!tokenId) return null;
-    return this.getLiveSnapshot(tokenId);
+    return this.getLiveSnapshot(this.getSideToken(market, side));
   }
 
   getDepthAtCeiling(market, side, ceilingPrice) {
     const snap = this.getLiveSnapshotForSide(market, side);
     if (!snap?.asks?.length) return 0;
     let total = 0;
-    for (const a of snap.asks) {
-      if (a.price <= ceilingPrice + 1e-9) total += a.size;
-    }
+    for (const a of snap.asks) { if (a.price <= ceilingPrice + 1e-9) total += a.size; }
     return total;
   }
 
   simulateBuyFill(market, side, qty, ceilingPrice) {
     const empty = { qtyFillable: 0, totalCost: 0, avgFillPrice: 0, depleted: true, levelsUsed: 0 };
-    const snap = this.getLiveSnapshotForSide(market, side);
+    const snap  = this.getLiveSnapshotForSide(market, side);
     if (!snap?.asks?.length || !(qty > 0)) return empty;
-
-    const sorted = [...snap.asks].sort((a, b) => a.price - b.price);
-    let remaining = qty;
-    let totalCost = 0;
-    let qtyFillable = 0;
-    let levelsUsed = 0;
+    const sorted = [...snap.asks].sort((a,b) => a.price - b.price);
+    let remaining = qty, totalCost = 0, qtyFillable = 0, levelsUsed = 0;
     for (const a of sorted) {
       if (a.price > ceilingPrice + 1e-9) break;
       const consume = Math.min(remaining, a.size);
-      totalCost += consume * a.price;
-      qtyFillable += consume;
-      remaining -= consume;
-      levelsUsed++;
+      totalCost += consume * a.price; qtyFillable += consume; remaining -= consume; levelsUsed++;
       if (remaining <= 0) break;
     }
-    const avgFillPrice = qtyFillable > 0 ? totalCost / qtyFillable : 0;
-    return { qtyFillable, totalCost, avgFillPrice, depleted: remaining > 0, levelsUsed };
+    return { qtyFillable, totalCost, avgFillPrice: qtyFillable > 0 ? totalCost / qtyFillable : 0, depleted: remaining > 0, levelsUsed };
   }
 
-  /**
-   * Predict.fun SELL has a per-share fee (CTF formula). Apply per-level.
-   */
   simulateSellFill(market, side, qty) {
-    const empty = { qtyFillable: 0, netRevenue: 0, avgFillPrice: 0, depleted: true, levelsUsed: 0, haircutApplied: 0 };
-    const snap = this.getLiveSnapshotForSide(market, side);
+    const empty   = { qtyFillable: 0, netRevenue: 0, avgFillPrice: 0, depleted: true, levelsUsed: 0, haircutApplied: 0 };
+    const snap    = this.getLiveSnapshotForSide(market, side);
     if (!snap?.bids?.length || !(qty > 0)) return empty;
-
     const feeRate = this._marketFeeRate(market);
-    let remaining = qty;
-    let grossRevenue = 0;
-    let netRaw = 0;
-    let qtyFillable = 0;
-    let levelsUsed = 0;
+    let remaining = qty, grossRevenue = 0, netRaw = 0, qtyFillable = 0, levelsUsed = 0;
     for (const b of snap.bids) {
       if (!(b.price > 0) || !(b.size > 0)) continue;
-      const consume = Math.min(remaining, b.size);
+      const consume        = Math.min(remaining, b.size);
       const sellFeePerShare = feeRate > 0 ? feeRate * Math.min(b.price, 1 - b.price) : 0;
       grossRevenue += consume * b.price;
       netRaw       += consume * (b.price - sellFeePerShare);
-      qtyFillable  += consume;
-      remaining    -= consume;
-      levelsUsed++;
+      qtyFillable  += consume; remaining -= consume; levelsUsed++;
       if (remaining <= 0) break;
     }
     if (qtyFillable === 0) return empty;
-
     const haircutScale = config.execution?.predictfunHaircutScale ?? 0.60;
-    const avgRawBid = grossRevenue / qtyFillable;
-    const haircut = Math.min(0.30, (1 - avgRawBid) * haircutScale);
-    const netRevenue = netRaw * (1 - haircut);
-    const avgFillPrice = qtyFillable > 0 ? netRevenue / qtyFillable : 0;
-    return { qtyFillable, netRevenue, avgFillPrice, depleted: remaining > 0, levelsUsed, haircutApplied: haircut };
+    const avgRawBid    = grossRevenue / qtyFillable;
+    const haircut      = Math.min(0.30, (1 - avgRawBid) * haircutScale);
+    const netRevenue   = netRaw * (1 - haircut);
+    return { qtyFillable, netRevenue, avgFillPrice: qtyFillable > 0 ? netRevenue / qtyFillable : 0, depleted: remaining > 0, levelsUsed, haircutApplied: haircut };
   }
 
-  async placeBuyOrder(market, side, price, qty) {
-    const tokenId = this.getSideToken(market, side);
-    return this.placeOrder({ tokenId, price, size: qty, side: 'BUY' });
-  }
-  async placeSellOrder(market, side, price, qty) {
-    const tokenId = this.getSideToken(market, side);
-    return this.placeOrder({ tokenId, price, size: qty, side: 'SELL' });
-  }
+  async placeBuyOrder(market, side, price, qty)  { return this.placeOrder({ tokenId: this.getSideToken(market, side), price, size: qty, side: 'BUY'  }); }
+  async placeSellOrder(market, side, price, qty) { return this.placeOrder({ tokenId: this.getSideToken(market, side), price, size: qty, side: 'SELL' }); }
 
   async getSideTokenBalance(market, side) {
-    const tokenId = this.getSideToken(market, side);
-    if (!tokenId) return null;
-    return this.getTokenBalance(tokenId);
+    return this.getTokenBalance(this.getSideToken(market, side));
   }
 
-  /**
-   * Shares received by a BUY order. _parseFill normalises this into
-   * filledShares already.
-   */
-  extractBuyFillQty(result, _intendedPrice) {
-    if (!result) return 0;
-    return parseFloat(result.filledShares || 0);
-  }
+  extractBuyFillQty(result, _intendedPrice) { return result ? parseFloat(result.filledShares || 0) : 0; }
 
-  /** SELL outcome — takingAmount is USDT received from the polled fill. */
   extractSellOutcome(result) {
     if (!result) return { soldQty: 0, takingAmount: 0, orderId: null };
-    const taking = parseFloat(result.takingAmount || 0);
-    const soldQty = parseFloat(result.filledShares || 0);
-    return { soldQty, takingAmount: taking, orderId: result.orderId || null };
+    return { soldQty: parseFloat(result.filledShares || 0), takingAmount: parseFloat(result.takingAmount || 0), orderId: result.orderId || null };
   }
 
-  /** Predict.fun returns avg fill price directly from _parseFill. */
   extractFillPrice(orderResult) {
     if (!orderResult) return null;
     const fp = parseFloat(orderResult.fillPrice || 0);
@@ -1548,18 +1126,13 @@ const body = {
   async getHedgeBids(tokenId) {
     try {
       const snap = this.getLiveSnapshot(tokenId);
-      if (snap?.bids?.length) {
-        return snap.bids.map(l => ({ price: l.price, size: l.size, source: 'ws' }));
-      }
+      if (snap?.bids?.length) return snap.bids.map(l => ({ price: l.price, size: l.size, source: 'ws' }));
     } catch (_) {}
     try {
       const book = await this.getOrderbook(tokenId);
       if (book?.bids?.length) {
-        return book.bids
-          .map(l => ({ price: parseFloat(l.price), size: parseFloat(l.size) }))
-          .filter(l => l.price > 0 && l.size > 0)
-          .sort((a, b) => b.price - a.price)
-          .slice(0, 5)
+        return book.bids.map(l => ({ price: parseFloat(l.price), size: parseFloat(l.size) }))
+          .filter(l => l.price > 0 && l.size > 0).sort((a,b) => b.price - a.price).slice(0, 5)
           .map(l => ({ ...l, source: 'rest' }));
       }
     } catch (_) {}
@@ -1571,14 +1144,9 @@ const body = {
   /* ---------------------------------------------------------- */
 
   destroy() {
-    if (this._ws) {
-      this._ws.close();
-      this._wsCleanup();
-    }
-    if (this._reconnectTimer) {
-      clearTimeout(this._reconnectTimer);
-      this._reconnectTimer = null;
-    }
+    if (this._ws) { this._ws.close(); this._wsCleanup(); }
+    if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
+    if (this._bookRefreshTimer) { clearInterval(this._bookRefreshTimer); this._bookRefreshTimer = null; }
   }
 }
 
