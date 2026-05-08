@@ -891,15 +891,16 @@ class PredictFunConnector extends EventEmitter {
 
       // Step 6: POST /v1/orders
       await this._ensureJwt();
-      const body = {
-        data: {
-          order:         { ...signedOrder, hash },
-          pricePerShare: pricePerShare.toString(),
-          strategy:      'MARKET',
-          slippageBps:   slippageBps?.toString() || '50',
-          ...(side === Side.BUY ? { isMinAmountOut: true } : {}),
-        },
+      // Doc: isMinAmountOut só se aplica a BUY orders com slippage
+      // https://dev.predict.fun/how-to-create-or-cancel-orders-679306m0.md#how-to-apply-slippage
+      const bodyData = {
+        order:         { ...signedOrder, hash },
+        pricePerShare: pricePerShare.toString(),
+        strategy:      'MARKET',
       };
+      if (slippageBps != null) bodyData.slippageBps = slippageBps.toString();
+      if (side === Side.BUY)   bodyData.isMinAmountOut = true;
+      const body = { data: bodyData };
 
       const t0   = Date.now();
       const resp = await axios.post(`${this.baseUrl}/v1/orders`, body, {
@@ -920,7 +921,7 @@ class PredictFunConnector extends EventEmitter {
       const orderId = String(rdata.orderId);
       console.log(`[PredictFun] order placed orderId=${orderId} — polling for fill...`);
 
-      const fillData = await this._pollFill(orderId, 3000);
+      const fillData = await this._pollFill(orderId, 10000);
       if (fillData) {
         return {
           orderId,
