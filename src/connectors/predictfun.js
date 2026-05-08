@@ -1150,7 +1150,7 @@ class PredictFunConnector extends EventEmitter {
     // signatureType=0. The CLOB internally maps the Privy wallet (0x09F...) to
     // the predictAccount (0x010b41...) and debits from there.
     const makerAddress  = this.predictAccount;
-    const signerAddress = this.wallet.address;
+    const signerAddress = this.predictAccount;
 
     const tokenId = order.tokenId;
     const side    = order.side === 'BUY' ? 0 : 1; // 0=BUY, 1=SELL
@@ -1190,7 +1190,16 @@ class PredictFunConnector extends EventEmitter {
 const priceWei  = toWei(price);
 
 // Cálculo base sem buffer manual — slippage é tratado pelo slippageBps no body
-let usdtWei = (priceWei * sharesWei) / BigInt(1_000_000_000_000_000_000n);
+const FEE_DENOMINATOR = BigInt(10000);
+const feeRateBigInt   = BigInt(feeRateBps);
+
+let usdtWei;
+if (side === 0) {
+  const baseUsdt = (priceWei * sharesWei) / WEI;
+  usdtWei = (baseUsdt * (FEE_DENOMINATOR + feeRateBigInt)) / FEE_DENOMINATOR;
+} else {
+  usdtWei = (priceWei * sharesWei) / WEI;
+}
 
 const makerAmount = side === 0 ? usdtWei : sharesWei;
 const takerAmount = side === 0 ? sharesWei : usdtWei;
@@ -1203,8 +1212,8 @@ const nonce      = BigInt(0);
 
 const orderValue = {
   salt,
-  maker:         signerAddress,   // wallet.address — maker deve === signer ✅
-  signer:        signerAddress,   // wallet.address — quem assina ✅
+  maker:         makerAddress,   // wallet.address — maker deve === signer ✅
+  signer:        makerAddress,   // wallet.address — quem assina ✅
   taker:         '0x0000000000000000000000000000000000000000',
   tokenId:       BigInt(tokenId),
   makerAmount,
@@ -1240,8 +1249,8 @@ const body = {
     slippageBps:    50,
     order: {
       salt:          salt.toString(),
-      maker:         signerAddress,   // wallet.address — maker deve === signer ✅
-      signer:        signerAddress,   // wallet.address — quem assina ✅
+      maker:         makerAddress,   // wallet.address — maker deve === signer ✅
+      signer:        makerAddress,   // wallet.address — quem assina ✅
       taker:         '0x0000000000000000000000000000000000000000',
       tokenId:       tokenId,
       makerAmount:   makerAmtStr,
