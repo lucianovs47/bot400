@@ -891,12 +891,16 @@ class PredictFunConnector extends EventEmitter {
 
       // Step 6: POST /v1/orders
       await this._ensureJwt();
-      // Doc: isMinAmountOut só se aplica a BUY orders com slippage
-      // https://dev.predict.fun/how-to-create-or-cancel-orders-679306m0.md#how-to-apply-slippage
+      // Doc: isMinAmountOut — "takerAmount is deflated and represents a signed minimum,
+      // not the actual fill target. When true the backend derives the actual share
+      // quantity from makerAmount * 1e18 / priceInCurrency"
+      // reservedBalancePolicy: SKIP_RESERVED_BALANCE_CHECKS evita cancelamentos
+      // por saldo temporariamente reservado de operações anteriores.
       const bodyData = {
-        order:         { ...signedOrder, hash },
-        pricePerShare: pricePerShare.toString(),
-        strategy:      'MARKET',
+        order:                  { ...signedOrder, hash },
+        pricePerShare:          pricePerShare.toString(),
+        strategy:               'MARKET',
+        reservedBalancePolicy:  'SKIP_RESERVED_BALANCE_CHECKS',
       };
       if (slippageBps != null) bodyData.slippageBps = slippageBps.toString();
       if (side === Side.BUY)   bodyData.isMinAmountOut = true;
