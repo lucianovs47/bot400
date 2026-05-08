@@ -1203,8 +1203,8 @@ const nonce      = BigInt(0);
 
 const orderValue = {
   salt,
-  maker:         makerAddress,
-  signer:        makerAddress,
+  maker:         makerAddress,    // predictAccount  — quem tem o USDT
+  signer:        signerAddress,   // wallet.address  — quem assina ✅ (era makerAddress, ERRO)
   taker:         '0x0000000000000000000000000000000000000000',
   tokenId:       BigInt(tokenId),
   makerAmount,
@@ -1216,7 +1216,7 @@ const orderValue = {
   signatureType: 0,
 };
 
-// ✅ LINHA QUE ESTAVA FALTANDO — assina o orderValue antes de montar o body
+// Assina o orderValue com EIP-712
 let signature;
 try {
   signature = await this.wallet.signTypedData(domain, ORDER_TYPES, orderValue);
@@ -1240,8 +1240,8 @@ const body = {
     slippageBps:    50,
     order: {
       salt:          salt.toString(),
-      maker:         makerAddress,
-      signer:        makerAddress,
+      maker:         makerAddress,    // predictAccount  — quem tem o USDT
+      signer:        signerAddress,   // wallet.address  — quem assina ✅ (era makerAddress, ERRO)
       taker:         '0x0000000000000000000000000000000000000000',
       tokenId:       tokenId,
       makerAmount:   makerAmtStr,
@@ -1251,7 +1251,7 @@ const body = {
       feeRateBps:    String(feeRateBps),
       side:          side,
       signatureType: 0,
-      signature,     // ✅ agora definida
+      signature,
     },
   },
 };
