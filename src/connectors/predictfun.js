@@ -1189,18 +1189,21 @@ class PredictFunConnector extends EventEmitter {
     const sharesWei = toWei(size);
     const priceWei  = toWei(price);
     
-    // Cálculo seguro usando BigInt (evita erro de floating point do JavaScript)
-    // Ex: 0.65 * 3.26 agora fica exato, sem sobra de 0.0000000000000003
-    const usdtWei   = (priceWei * sharesWei) / BigInt(1_000_000_000_000_000_000n); // divide por 1e18
+    // Cálculo base seguro
+    let usdtWei = (priceWei * sharesWei) / BigInt(1_000_000_000_000_000_000n);
 
-    const makerAmount = side === 0 ? usdtWei : sharesWei; // BUY: pay USDT; SELL: give shares
-    const takerAmount = side === 0 ? sharesWei : usdtWei; // BUY: get shares; SELL: get USDT
+    // Adiciona o FEE da plataforma (exatamente como a Predict calcula internamente)
+    const fee = (usdtWei * BigInt(feeRateBps)) / BigInt(10000);
+    usdtWei = usdtWei + fee;   // ← isso é o que estava faltando
 
-    // === DEBUG - veja exatamente o que está sendo enviado ===
-    console.log(`[PredictFun] DEBUG AMOUNTS → size=${size} price=${price} | usdtWei=${usdtWei} sharesWei=${sharesWei}`);
-    
+    const makerAmount = side === 0 ? usdtWei : sharesWei;
+    const takerAmount = side === 0 ? sharesWei : usdtWei;
+
+    // DEBUG (para vermos o valor exato que está sendo enviado)
+    console.log(`[PredictFun] DEBUG AMOUNTS → size=${size} price=${price} feeRateBps=${feeRateBps} | usdtWei=${usdtWei} sharesWei=${sharesWei}`);
+
     const salt = BigInt(Math.floor(Math.random() * 1e15));
-    const expiration = BigInt(Math.floor(Date.now() / 1000) + 300); // 5 min (MARKET strategy)
+    const expiration = BigInt(Math.floor(Date.now() / 1000) + 300);
     const nonce = BigInt(0);
 
     const orderValue = {
