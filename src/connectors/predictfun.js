@@ -1197,53 +1197,64 @@ const takerAmount = side === 0 ? sharesWei : usdtWei;
 
 console.log(`[PredictFun] DEBUG AMOUNTS → size=${size} price=${price} feeRateBps=${feeRateBps} | usdtWei=${usdtWei} sharesWei=${sharesWei} makerAmount=${makerAmount}`);
 
-const salt = BigInt(Math.floor(Math.random() * 1e15));
+const salt       = BigInt(Math.floor(Math.random() * 1e15));
 const expiration = BigInt(Math.floor(Date.now() / 1000) + 300);
-const nonce = BigInt(0);
+const nonce      = BigInt(0);
 
 const orderValue = {
-  salt: salt,
-  maker: makerAddress,    // predictAccount
-  signer: makerAddress,   // predictAccount — doc: "set signer and maker to predictAccount"
-  taker: '0x0000000000000000000000000000000000000000',
-  tokenId: BigInt(tokenId),
+  salt,
+  maker:         makerAddress,
+  signer:        makerAddress,
+  taker:         '0x0000000000000000000000000000000000000000',
+  tokenId:       BigInt(tokenId),
   makerAmount,
   takerAmount,
   expiration,
   nonce,
-  feeRateBps: BigInt(feeRateBps),
-  side: side,
+  feeRateBps:    BigInt(feeRateBps),
+  side:          side,
   signatureType: 0,
 };
 
-    // predict.fun API requires pricePerShare as uint256 wei string (1e18).
-    // e.g. 0.3 → "300000000000000000". toWei() handles IEEE-754 precision.
-    const priceStr     = toWei(price).toString();
-    const makerAmtStr  = makerAmount.toString();
-    const takerAmtStr  = takerAmount.toString();
-    const body = {
-      data: {
-        strategy:      'MARKET',
-        pricePerShare: priceStr,
-        isMinAmountOut: side === 0,
-        slippageBps:   50, // 0.5% slippage tolerance to improve fill rate
-        order: {
-          salt:          salt.toString(),
-          maker:         makerAddress,
-          signer:        makerAddress,
-          taker:         '0x0000000000000000000000000000000000000000',
-          tokenId:       tokenId,
-          makerAmount:   makerAmtStr,
-          takerAmount:   takerAmtStr,
-          expiration:    expiration.toString(),
-          nonce:         '0',
-          feeRateBps:    String(feeRateBps),
-          side:          side,
-          signatureType: 0,
-          signature,
-        },
-      },
-    };
+// ✅ LINHA QUE ESTAVA FALTANDO — assina o orderValue antes de montar o body
+let signature;
+try {
+  signature = await this.wallet.signTypedData(domain, ORDER_TYPES, orderValue);
+} catch (err) {
+  console.error(`[PredictFun] EIP-712 signTypedData failed: ${err.message}`);
+  this._lastOrderError = { type: 'other', message: `sign failed: ${err.message}` };
+  return null;
+}
+
+// predict.fun API requires pricePerShare as uint256 wei string (1e18).
+// e.g. 0.3 → "300000000000000000". toWei() handles IEEE-754 precision.
+const priceStr    = toWei(price).toString();
+const makerAmtStr = makerAmount.toString();
+const takerAmtStr = takerAmount.toString();
+
+const body = {
+  data: {
+    strategy:       'MARKET',
+    pricePerShare:  priceStr,
+    isMinAmountOut: side === 0,
+    slippageBps:    50,
+    order: {
+      salt:          salt.toString(),
+      maker:         makerAddress,
+      signer:        makerAddress,
+      taker:         '0x0000000000000000000000000000000000000000',
+      tokenId:       tokenId,
+      makerAmount:   makerAmtStr,
+      takerAmount:   takerAmtStr,
+      expiration:    expiration.toString(),
+      nonce:         '0',
+      feeRateBps:    String(feeRateBps),
+      side:          side,
+      signatureType: 0,
+      signature,     // ✅ agora definida
+    },
+  },
+};
 
     await this._ensureJwt();
     try {
