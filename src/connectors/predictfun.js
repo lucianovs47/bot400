@@ -1149,7 +1149,7 @@ class PredictFunConnector extends EventEmitter {
     // The only accepted combination is EOA mode: maker=signer=wallet.address,
     // signatureType=0. The CLOB internally maps the Privy wallet (0x09F...) to
     // the predictAccount (0x010b41...) and debits from there.
-    const makerAddress  = this.predictAccount;
+    const makerAddress  = this.wallet.address;
     const signerAddress = this.wallet.address;
 
     const tokenId = order.tokenId;
